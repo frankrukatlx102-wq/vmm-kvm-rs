@@ -28,6 +28,24 @@ pub struct Hw {
 }
 
 #[derive(Clone)]
+pub struct DiskInfo {
+    pub target: String,
+    pub bus: String,
+    pub device: String,
+    pub file: String,
+    pub driver: String,
+    pub size_gb: u32,
+}
+
+#[derive(Clone)]
+pub struct NetInfo {
+    pub mac: String,
+    pub model: String,
+    pub source: String,
+    pub iface_type: String,
+}
+
+#[derive(Clone)]
 pub struct SnapInfo {
     pub name: String,
     pub desc: String,
@@ -295,6 +313,121 @@ fn define_domain_with_uefi(conn: &Connect, xml: &str, name: &str, want_uefi: boo
         }
         Err(e) => Err(e.into()),
     }
+}
+
+fn root_uefi(root: &Element) -> bool {
+    let Some(osel) = child(root, "os") else {
+        return false;
+    };
+    osel.attributes
+        .get("firmware")
+        .map(|value| value == "efi")
+        .unwrap_or(false)
+        || child(osel, "loader").is_some()
+}
+
+fn target_prefix(bus: &str) -> &'static str {
+    match bus {
+        "ide" => "hd",
+        "virtio" => "vd",
+        _ => "sd",
+    }
+}
+
+fn used_targets(root: &Element) -> Vec<String> {
+    let Some(devices) = child(root, "devices") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for node in &devices.children {
+        let XMLNode::Element(disk) = node else {
+            continue;
+        };
+        if disk.name != "disk" {
+            continue;
+        }
+        if let Some(target) = child(disk, "target") {
+            if let Some(dev) = target.attributes.get("dev") {
+                out.push(dev.clone());
+            }
+        }
+    }
+    out
+}
+
+fn free_target(root: &Element, bus: &str) -> String {
+    let used = used_targets(root);
+    let prefix = target_prefix(bus);
+    for letter in 'a'..='z' {
+        let candidate = format!("{prefix}{letter}");
+        if !used.iter().any(|dev| dev == &candidate) {
+            return candidate;
+        }
+    }
+    format!("{prefix}z")
+}
+
+fn new_mac() -> String {
+    use std::io::Read;
+    let mut bytes = [0u8; 3];
+    if let Ok(mut file) = std::fs::File::open("/dev/urandom") {
+        let _ = file.read_exact(&mut bytes);
+    }
+    format!(
+        "52:54:00:{:02x}:{:02x}:{:02x}",
+        bytes[0], bytes[1], bytes[2]
+    )
+}
+
+fn disk_element(path: &str, target: &str, bus: &str, cdrom: bool, ro: bool) -> Element {
+    let mut disk = Element::new("disk");
+    disk.attributes.insert("type".into(), "file".into());
+    disk.attributes.insert(
+        "device".into(),
+        if cdrom { "cdrom".into() } else { "disk".into() },
+    );
+    if !cdrom {
+        let mut driver = Element::new("driver");
+        driver.attributes.insert("name".into(), "qemu".into());
+        driver.attributes.insert("type".into(), "qcow2".into());
+        disk.children.push(XMLNode::Element(driver));
+    }
+    if !path.is_empty() {
+        let mut source = Element::new("source");
+        source.attributes.insert("file".into(), path.into());
+        disk.children.push(XMLNode::Element(source));
+    }
+    let mut target_el = Element::new("target");
+    target_el.attributes.insert("dev".into(), target.into());
+    target_el.attributes.insert("bus".into(), bus.into());
+    disk.children.push(XMLNode::Element(target_el));
+    if cdrom || ro {
+        disk.children
+            .push(XMLNode::Element(Element::new("readonly")));
+    }
+    disk
+}
+
+fn interface_element(
+    iface_type: &str,
+    source: Option<(&str, &str)>,
+    model: &str,
+    mac: &str,
+) -> Element {
+    let mut iface = Element::new("interface");
+    iface.attributes.insert("type".into(), iface_type.into());
+    if let Some((key, value)) = source {
+        let mut source_el = Element::new("source");
+        source_el.attributes.insert(key.into(), value.into());
+        iface.children.push(XMLNode::Element(source_el));
+    }
+    let mut mac_el = Element::new("mac");
+    mac_el.attributes.insert("address".into(), mac.into());
+    iface.children.push(XMLNode::Element(mac_el));
+    let mut model_el = Element::new("model");
+    model_el.attributes.insert("type".into(), model.into());
+    iface.children.push(XMLNode::Element(model_el));
+    iface
 }
 
 impl Backend {
@@ -817,6 +950,325 @@ impl Backend {
     pub fn snap_delete(&self, name: &str, snapname: &str) -> Result<()> {
         let dom = self.find(name)?;
         Domain::lookup_snapshot_by_name(&dom, snapname, 0)?.delete(0)?;
+        Ok(())
+    }
+
+    pub fn disks(&self, name: &str) -> Result<Vec<DiskInfo>> {
+        let dom = self.find(name)?;
+        let xml = dom.xml_desc(sys::VIR_DOMAIN_XML_INACTIVE)?;
+        let root = parse(&xml)?;
+        let Some(devices) = child(&root, "devices") else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for node in &devices.children {
+            let XMLNode::Element(disk) = node else {
+                continue;
+            };
+            if disk.name != "disk" {
+                continue;
+            }
+            let target = child(disk, "target");
+            let source = child(disk, "source");
+            let driver = child(disk, "driver");
+            let file = source
+                .and_then(|el| el.attributes.get("file").cloned())
+                .unwrap_or_default();
+            let device = disk
+                .attributes
+                .get("device")
+                .cloned()
+                .unwrap_or_else(|| "disk".into());
+            let size_gb = if device == "cdrom" {
+                0
+            } else {
+                qcow2_gb(&file).unwrap_or(0)
+            };
+            out.push(DiskInfo {
+                target: target
+                    .and_then(|el| el.attributes.get("dev").cloned())
+                    .unwrap_or_default(),
+                bus: target
+                    .and_then(|el| el.attributes.get("bus").cloned())
+                    .unwrap_or_default(),
+                device,
+                file,
+                driver: driver
+                    .and_then(|el| el.attributes.get("type").cloned())
+                    .unwrap_or_default(),
+                size_gb,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn add_disk(&self, name: &str, size_gb: u32, bus: &str) -> Result<String> {
+        let dom = self.find(name)?;
+        let xml = dom.xml_desc(sys::VIR_DOMAIN_XML_INACTIVE)?;
+        let mut root = parse(&xml)?;
+        let dir = home_dir()
+            .join("VirtualMachines")
+            .join("vms")
+            .join(safe_dir(name));
+        std::fs::create_dir_all(&dir)?;
+        let mut index = 1;
+        let path = loop {
+            let candidate = dir.join(format!("disk{index}.qcow2"));
+            if !candidate.exists() {
+                break candidate;
+            }
+            index += 1;
+        };
+        let status = Command::new("qemu-img")
+            .args(["create", "-f", "qcow2"])
+            .arg(&path)
+            .arg(format!("{size_gb}G"))
+            .status()?;
+        if !status.success() {
+            return Err(anyhow!("qemu-img failed"));
+        }
+        let target = free_target(&root, bus);
+        let disk = disk_element(&path.to_string_lossy(), &target, bus, false, false);
+        let disk_xml = xml_string(&disk)?;
+        if let Some(devices) = child_mut(&mut root, "devices") {
+            devices.children.push(XMLNode::Element(disk));
+        }
+        define_domain_with_uefi(&self.conn, &xml_string(&root)?, name, root_uefi(&root))?;
+        if dom.is_active().unwrap_or(false) {
+            let _ = dom.attach_device_flags(&disk_xml, sys::VIR_DOMAIN_AFFECT_LIVE);
+        }
+        Ok(target)
+    }
+
+    pub fn remove_disk(&self, name: &str, target: &str) -> Result<()> {
+        let dom = self.find(name)?;
+        let xml = dom.xml_desc(sys::VIR_DOMAIN_XML_INACTIVE)?;
+        let mut root = parse(&xml)?;
+        let mut removed = None;
+        if let Some(devices) = child_mut(&mut root, "devices") {
+            let mut index = None;
+            for (i, node) in devices.children.iter().enumerate() {
+                let XMLNode::Element(disk) = node else {
+                    continue;
+                };
+                if disk.name != "disk" {
+                    continue;
+                }
+                let matches = child(disk, "target")
+                    .and_then(|el| el.attributes.get("dev"))
+                    .map(|dev| dev == target)
+                    .unwrap_or(false);
+                if matches {
+                    removed = Some(disk.clone());
+                    index = Some(i);
+                    break;
+                }
+            }
+            if let Some(index) = index {
+                devices.children.remove(index);
+            }
+        }
+        let Some(removed) = removed else {
+            return Err(anyhow!("disk not found: {target}"));
+        };
+        let removed_xml = xml_string(&removed)?;
+        define_domain_with_uefi(&self.conn, &xml_string(&root)?, name, root_uefi(&root))?;
+        if dom.is_active().unwrap_or(false) {
+            let _ = dom.detach_device_flags(&removed_xml, sys::VIR_DOMAIN_AFFECT_LIVE);
+        }
+        Ok(())
+    }
+
+    pub fn attach_iso(&self, name: &str, iso: Option<&str>) -> Result<()> {
+        let dom = self.find(name)?;
+        let xml = dom.xml_desc(sys::VIR_DOMAIN_XML_INACTIVE)?;
+        let mut root = parse(&xml)?;
+        let machine = child(&root, "os")
+            .and_then(|osel| child(osel, "type"))
+            .and_then(|el| el.attributes.get("machine").cloned())
+            .unwrap_or_else(|| "pc".into());
+        let bus = if machine.contains("q35") {
+            "sata"
+        } else {
+            "ide"
+        };
+        let target = free_target(&root, bus);
+        let mut existing = false;
+        let mut changed = None;
+        if let Some(devices) = child_mut(&mut root, "devices") {
+            let mut cdrom_index = None;
+            for (i, node) in devices.children.iter().enumerate() {
+                let XMLNode::Element(disk) = node else {
+                    continue;
+                };
+                if disk.name == "disk"
+                    && disk
+                        .attributes
+                        .get("device")
+                        .map(|d| d == "cdrom")
+                        .unwrap_or(false)
+                {
+                    cdrom_index = Some(i);
+                    break;
+                }
+            }
+            if let Some(i) = cdrom_index {
+                existing = true;
+                let XMLNode::Element(disk) = &mut devices.children[i] else {
+                    unreachable!()
+                };
+                let mut source_index = None;
+                for (j, node) in disk.children.iter().enumerate() {
+                    if matches!(node, XMLNode::Element(e) if e.name == "source") {
+                        source_index = Some(j);
+                        break;
+                    }
+                }
+                match iso {
+                    Some(path) => {
+                        if let Some(j) = source_index {
+                            if let XMLNode::Element(source) = &mut disk.children[j] {
+                                source.attributes.insert("file".into(), path.into());
+                            }
+                        } else {
+                            let mut source = Element::new("source");
+                            source.attributes.insert("file".into(), path.into());
+                            disk.children.insert(0, XMLNode::Element(source));
+                        }
+                    }
+                    None => {
+                        if let Some(j) = source_index {
+                            disk.children.remove(j);
+                        }
+                    }
+                }
+                changed = Some(disk.clone());
+            } else {
+                let disk = disk_element(iso.unwrap_or(""), &target, bus, true, true);
+                changed = Some(disk.clone());
+                devices.children.push(XMLNode::Element(disk));
+            }
+        }
+        define_domain_with_uefi(&self.conn, &xml_string(&root)?, name, root_uefi(&root))?;
+        if dom.is_active().unwrap_or(false) {
+            if let Some(disk) = changed {
+                let disk_xml = xml_string(&disk)?;
+                if existing {
+                    let _ = dom.update_device_flags(&disk_xml, sys::VIR_DOMAIN_AFFECT_LIVE);
+                } else {
+                    let _ = dom.attach_device_flags(&disk_xml, sys::VIR_DOMAIN_AFFECT_LIVE);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn nics(&self, name: &str) -> Result<Vec<NetInfo>> {
+        let dom = self.find(name)?;
+        let xml = dom.xml_desc(sys::VIR_DOMAIN_XML_INACTIVE)?;
+        let root = parse(&xml)?;
+        let Some(devices) = child(&root, "devices") else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for node in &devices.children {
+            let XMLNode::Element(iface) = node else {
+                continue;
+            };
+            if iface.name != "interface" {
+                continue;
+            }
+            let source = child(iface, "source");
+            let source_value = source
+                .and_then(|el| {
+                    el.attributes
+                        .get("network")
+                        .or_else(|| el.attributes.get("bridge"))
+                        .or_else(|| el.attributes.get("dev"))
+                        .cloned()
+                })
+                .unwrap_or_default();
+            out.push(NetInfo {
+                mac: child(iface, "mac")
+                    .and_then(|el| el.attributes.get("address").cloned())
+                    .unwrap_or_default(),
+                model: child(iface, "model")
+                    .and_then(|el| el.attributes.get("type").cloned())
+                    .unwrap_or_default(),
+                source: source_value,
+                iface_type: iface
+                    .attributes
+                    .get("type")
+                    .cloned()
+                    .unwrap_or_else(|| "user".into()),
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn add_nic(&self, name: &str, model: &str) -> Result<String> {
+        let dom = self.find(name)?;
+        let xml = dom.xml_desc(sys::VIR_DOMAIN_XML_INACTIVE)?;
+        let mut root = parse(&xml)?;
+        let existing = self.nics(name)?;
+        let mut mac = new_mac();
+        let mut guard = 0;
+        while existing.iter().any(|nic| nic.mac == mac) && guard < 32 {
+            mac = new_mac();
+            guard += 1;
+        }
+        let iface = if self.is_session() {
+            interface_element("user", None, model, &mac)
+        } else {
+            interface_element("network", Some(("network", "default")), model, &mac)
+        };
+        let iface_xml = xml_string(&iface)?;
+        if let Some(devices) = child_mut(&mut root, "devices") {
+            devices.children.push(XMLNode::Element(iface));
+        }
+        define_domain_with_uefi(&self.conn, &xml_string(&root)?, name, root_uefi(&root))?;
+        if dom.is_active().unwrap_or(false) {
+            let _ = dom.attach_device_flags(&iface_xml, sys::VIR_DOMAIN_AFFECT_LIVE);
+        }
+        Ok(mac)
+    }
+
+    pub fn remove_nic(&self, name: &str, mac: &str) -> Result<()> {
+        let dom = self.find(name)?;
+        let xml = dom.xml_desc(sys::VIR_DOMAIN_XML_INACTIVE)?;
+        let mut root = parse(&xml)?;
+        let mut removed = None;
+        if let Some(devices) = child_mut(&mut root, "devices") {
+            let mut index = None;
+            for (i, node) in devices.children.iter().enumerate() {
+                let XMLNode::Element(iface) = node else {
+                    continue;
+                };
+                if iface.name != "interface" {
+                    continue;
+                }
+                let matches = child(iface, "mac")
+                    .and_then(|el| el.attributes.get("address"))
+                    .map(|value| value == mac)
+                    .unwrap_or(false);
+                if matches {
+                    removed = Some(iface.clone());
+                    index = Some(i);
+                    break;
+                }
+            }
+            if let Some(index) = index {
+                devices.children.remove(index);
+            }
+        }
+        let Some(removed) = removed else {
+            return Err(anyhow!("interface not found: {mac}"));
+        };
+        let removed_xml = xml_string(&removed)?;
+        define_domain_with_uefi(&self.conn, &xml_string(&root)?, name, root_uefi(&root))?;
+        if dom.is_active().unwrap_or(false) {
+            let _ = dom.detach_device_flags(&removed_xml, sys::VIR_DOMAIN_AFFECT_LIVE);
+        }
         Ok(())
     }
 

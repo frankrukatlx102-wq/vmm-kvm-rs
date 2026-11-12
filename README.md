@@ -10,12 +10,16 @@ Dark teal interface, VM cards with live CPU/RAM sparklines, one-screen VM creati
 - VM list with state badges and live CPU/RAM sparklines
 - Start, graceful shutdown, force off, reboot, pause/resume
 - SPICE/VNC console via `virt-viewer` (or `remote-viewer`)
-- One-screen creation: ISO list, automatic OS detection, 39 OS profiles, host-capped vCPU/RAM, disk size and KVM toggle
+- One-screen creation: ISO list, local ISO picker, automatic OS detection, 39 OS profiles, host-capped vCPU/RAM, disk size and KVM toggle
+- Inline VM name editing with UTF-8 support and automatic unique names
 - Hardware tab: vCPU, RAM, KVM, UEFI, TPM 2.0, video model, autostart
+- Disks tab: attach/eject ISO, add and remove qcow2 disks
+- Network tab: add and remove user-mode or bridged interfaces
+- Snapshots tab: create, revert and delete snapshots
 - UEFI domain definitions with an OVMF fallback for older libvirt versions
-- Delete with two-step confirmation; UEFI NVRAM cleanup when undefining
-- OS icons and a dark theme
-- English UI for now; localization is on the roadmap
+- Safe deletion: modal confirmation, running-VM guard and automatic `domain.xml.bak`
+- Five languages with live switching: English, Russian, Chinese, Portuguese (BR), Spanish
+- OS icons, a custom app icon and a dark teal theme
 
 Only libvirt session VMs are touched. The optional self-test creates VMs named `vmmself-rs-*` and removes them afterwards.
 
@@ -24,6 +28,8 @@ Only libvirt session VMs are touched. The optional self-test creates VMs named `
 - Linux with libvirt and QEMU/KVM
 - `qemu-img` for disk creation
 - `virt-viewer` or `remote-viewer` for the graphical console
+- `xdg-desktop-portal` for the local ISO picker (installed by most desktops; `zenity` is used as a fallback)
+- a CJK font such as Noto Sans CJK for the Chinese interface (common on most desktop distributions)
 - Rust toolchain (edition 2024)
 - Development packages for libvirt, Vulkan, Wayland/X11, fontconfig and freetype
 
@@ -70,9 +76,9 @@ The test creates a BIOS VM and a UEFI/q35 VM with unique `vmmself-rs-*` names, c
 
 ## Status
 
-Implemented: VM list, overview, hardware, console, VM creation, deletion, live statistics.
+Implemented: VM list, overview, hardware, disks, networks, snapshots, console, local ISO picker, manual VM names, live statistics and five-language UI.
 
-Roadmap: disks, networks, snapshots, storage pools, SSH hosts, snapshots UI, custom name input and file picker, five-language localization.
+Roadmap: storage pools, SSH hosts, VM cloning and import, and remote libvirt connections.
 
 ## License
 

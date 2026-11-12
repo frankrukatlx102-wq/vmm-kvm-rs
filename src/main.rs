@@ -2,6 +2,7 @@
 
 mod backend;
 mod hostinfo;
+mod i18n;
 mod osdata;
 mod ui;
 
@@ -125,6 +126,46 @@ fn run_selftest() -> i32 {
             ));
         }
         println!("ok: hardware read/write (2 vCPU, 1024 MiB)");
+
+        let target = b.add_disk(&name, 5, "virtio").map_err(|e| e.to_string())?;
+        let disks = b.disks(&name).map_err(|e| e.to_string())?;
+        if !disks
+            .iter()
+            .any(|disk| disk.target == target && disk.size_gb == 5)
+        {
+            return Err("added disk is missing or has the wrong size".to_string());
+        }
+        let iso = std::env::temp_dir().join("vmmself-rs-selftest.iso");
+        std::fs::write(&iso, b"").map_err(|e| e.to_string())?;
+        b.attach_iso(&name, Some(&iso.to_string_lossy()))
+            .map_err(|e| e.to_string())?;
+        let disks = b.disks(&name).map_err(|e| e.to_string())?;
+        if !disks
+            .iter()
+            .any(|disk| disk.device == "cdrom" && disk.file == iso.to_string_lossy())
+        {
+            return Err("ISO was not attached".to_string());
+        }
+        b.attach_iso(&name, None).map_err(|e| e.to_string())?;
+        b.remove_disk(&name, &target).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(&iso);
+        let disks = b.disks(&name).map_err(|e| e.to_string())?;
+        if disks.iter().any(|disk| disk.target == target) {
+            return Err("disk was not removed".to_string());
+        }
+        println!("ok: disk add/remove and ISO attach/eject");
+
+        let mac = b.add_nic(&name, "virtio").map_err(|e| e.to_string())?;
+        let nics = b.nics(&name).map_err(|e| e.to_string())?;
+        if !nics.iter().any(|nic| nic.mac == mac) {
+            return Err("added interface is missing".to_string());
+        }
+        b.remove_nic(&name, &mac).map_err(|e| e.to_string())?;
+        let nics = b.nics(&name).map_err(|e| e.to_string())?;
+        if nics.iter().any(|nic| nic.mac == mac) {
+            return Err("interface was not removed".to_string());
+        }
+        println!("ok: network interface add/remove");
 
         b.snap_create(&name, "snap-selftest", "selftest")
             .map_err(|e| e.to_string())?;

@@ -1,15 +1,19 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, ClickEvent, Context, Div, FontWeight, PromptLevel, Render, Rgba, SharedString,
-    Stateful, Timer, Window, div, prelude::*, px, rgb, svg,
+    AnyElement, ClickEvent, Context, CursorStyle, Div, FocusHandle, FontWeight, KeyDownEvent,
+    Render, Rgba, SharedString, Stateful, Timer, Window, div, prelude::*, px, rgb, svg,
 };
 
-use crate::backend::{self, Hw, SnapInfo, Vm};
+use crate::backend::{self, DiskInfo, Hw, NetInfo, SnapInfo, Vm};
 use crate::hostinfo;
+use crate::i18n::{self, Lang};
 use crate::osdata::{self, OsProfile};
+
+const DISK_BUSES: [&str; 4] = ["virtio", "sata", "ide", "scsi"];
+const NIC_MODELS: [&str; 3] = ["virtio", "e1000e", "rtl8139"];
 
 const BG: u32 = 0x0a141f;
 const PANEL: u32 = 0x0d1926;
@@ -62,6 +66,8 @@ enum Screen {
 enum Tab {
     Overview,
     Hardware,
+    Disks,
+    Network,
     Snapshots,
 }
 
@@ -83,6 +89,22 @@ enum BtnKind {
 enum HwField {
     Vcpu,
     Ram,
+}
+
+#[derive(Clone)]
+struct ConfirmDialog {
+    title: String,
+    body: String,
+    confirm: String,
+    action: ConfirmAction,
+    opened_at: Instant,
+}
+
+#[derive(Clone)]
+enum ConfirmAction {
+    DeleteVm(String),
+    RemoveDisk(String),
+    RemoveNic(String),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -110,7 +132,7 @@ struct VmStat {
 
 struct CreateForm {
     isos: Vec<PathBuf>,
-    iso: Option<usize>,
+    iso: Option<PathBuf>,
     profile_id: String,
     version: String,
     name: String,
@@ -152,20 +174,35 @@ pub struct VmmApp {
     screen: Screen,
     tab: Tab,
     hw: Option<Hw>,
+    disks: Vec<DiskInfo>,
+    nics: Vec<NetInfo>,
+    disks_sel: Option<String>,
+    nics_sel: Option<String>,
+    disk_add_open: bool,
+    disk_add_size: u32,
+    disk_add_bus: usize,
+    nic_model: usize,
     snaps: Vec<SnapInfo>,
     snap_arm: Option<SnapArm>,
+    confirm: Option<ConfirmDialog>,
     stats: HashMap<String, VmStat>,
     form: CreateForm,
     host_ram_mb: u32,
     host_cpus: u32,
     kvm_ok: bool,
     status: Option<(String, StatusKind)>,
+    lang: Lang,
+    name_focus: FocusHandle,
+    name_cursor: usize,
+    name_manual: bool,
+    name_fresh: bool,
+    name_focus_pending: bool,
     ticks: u64,
     started: bool,
 }
 
 impl VmmApp {
-    pub fn new(_cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         let (host_ram_mb, host_cpus) = backend::host_limits();
         let kvm_ok = hostinfo::kvm_available();
         let mut backend = None;
@@ -192,14 +229,36 @@ impl VmmApp {
             screen: Screen::Vms,
             tab: Tab::Overview,
             hw: None,
+            disks: Vec::new(),
+            nics: Vec::new(),
+            disks_sel: None,
+            nics_sel: None,
+            disk_add_open: false,
+            disk_add_size: 20,
+            disk_add_bus: 0,
+            nic_model: 0,
             snaps: Vec::new(),
             snap_arm: None,
+            confirm: Some(ConfirmDialog {
+                title: "Удалить vmmself-demo?".into(),
+                body: "Определение ВМ и NVRAM будут удалены. Файлы дисков останутся на диске."
+                    .into(),
+                confirm: "Удалить".into(),
+                action: ConfirmAction::DeleteVm("vmmself-demo".into()),
+                opened_at: Instant::now(),
+            }),
             stats: HashMap::new(),
             form,
             host_ram_mb,
             host_cpus,
             kvm_ok,
             status: None,
+            lang: i18n::load_lang(),
+            name_focus: cx.focus_handle(),
+            name_cursor: 0,
+            name_manual: false,
+            name_fresh: false,
+            name_focus_pending: false,
             ticks: 0,
             started: false,
         };
@@ -210,6 +269,27 @@ impl VmmApp {
 
     fn set_status(&mut self, msg: impl Into<String>, kind: StatusKind) {
         self.status = Some((msg.into(), kind));
+    }
+
+    fn t(&self, key: &str) -> &'static str {
+        i18n::tr(self.lang, key)
+    }
+
+    fn tf(&self, key: &str, args: &[(&str, String)]) -> String {
+        i18n::tf(self.lang, key, args)
+    }
+
+    fn set_lang(&mut self, lang: Lang, cx: &mut Context<Self>) {
+        self.lang = lang;
+        i18n::save_lang(lang);
+        let msg = self.tf("status.lang_changed", &[("lang", lang.label().to_string())]);
+        self.set_status(msg, StatusKind::Ok);
+        cx.notify();
+    }
+
+    fn cycle_lang(&mut self, cx: &mut Context<Self>) {
+        let next = i18n::next(self.lang);
+        self.set_lang(next, cx);
     }
 
     fn selected_vm(&self) -> Option<&Vm> {
@@ -228,6 +308,32 @@ impl VmmApp {
             .as_ref()
             .and_then(|name| self.backend.as_ref().and_then(|b| b.snapshots(name).ok()))
             .unwrap_or_default();
+        self.disks = self
+            .selected
+            .as_ref()
+            .and_then(|name| self.backend.as_ref().and_then(|b| b.disks(name).ok()))
+            .unwrap_or_default();
+        self.nics = self
+            .selected
+            .as_ref()
+            .and_then(|name| self.backend.as_ref().and_then(|b| b.nics(name).ok()))
+            .unwrap_or_default();
+        let disk_ok = self
+            .disks_sel
+            .as_ref()
+            .map(|target| self.disks.iter().any(|disk| &disk.target == target))
+            .unwrap_or(false);
+        if !disk_ok {
+            self.disks_sel = None;
+        }
+        let nic_ok = self
+            .nics_sel
+            .as_ref()
+            .map(|mac| self.nics.iter().any(|nic| &nic.mac == mac))
+            .unwrap_or(false);
+        if !nic_ok {
+            self.nics_sel = None;
+        }
     }
 
     fn reload_snaps(&mut self) {
@@ -236,6 +342,32 @@ impl VmmApp {
             .as_ref()
             .and_then(|name| self.backend.as_ref().and_then(|b| b.snapshots(name).ok()))
             .unwrap_or_default();
+        self.disks = self
+            .selected
+            .as_ref()
+            .and_then(|name| self.backend.as_ref().and_then(|b| b.disks(name).ok()))
+            .unwrap_or_default();
+        self.nics = self
+            .selected
+            .as_ref()
+            .and_then(|name| self.backend.as_ref().and_then(|b| b.nics(name).ok()))
+            .unwrap_or_default();
+        let disk_ok = self
+            .disks_sel
+            .as_ref()
+            .map(|target| self.disks.iter().any(|disk| &disk.target == target))
+            .unwrap_or(false);
+        if !disk_ok {
+            self.disks_sel = None;
+        }
+        let nic_ok = self
+            .nics_sel
+            .as_ref()
+            .map(|mac| self.nics.iter().any(|nic| &nic.mac == mac))
+            .unwrap_or(false);
+        if !nic_ok {
+            self.nics_sel = None;
+        }
     }
 
     fn ensure_selection(&mut self) {
@@ -273,7 +405,8 @@ impl VmmApp {
                     self.conn_uri = uri.to_string();
                     self.backend = Some(b);
                     self.refresh();
-                    self.set_status(format!("Connected to {uri}"), StatusKind::Ok);
+                    let msg = self.tf("conn.connected", &[("uri", uri.to_string())]);
+                    self.set_status(msg, StatusKind::Ok);
                     cx.notify();
                     return;
                 }
@@ -354,6 +487,9 @@ impl VmmApp {
     }
 
     fn form_sync_name(&mut self) {
+        if self.name_manual {
+            return;
+        }
         let profile = osdata::find(&self.form.profile_id);
         let base = osdata::auto_name(profile, &self.form.version);
         let base = if base.is_empty() {
@@ -362,6 +498,85 @@ impl VmmApp {
             base
         };
         self.form.name = self.unique_name(&base);
+        self.name_cursor = self.form.name.len();
+        self.name_fresh = false;
+    }
+
+    fn form_reset_name(&mut self, cx: &mut Context<Self>) {
+        self.name_manual = false;
+        self.name_fresh = false;
+        self.form_sync_name();
+        cx.notify();
+    }
+
+    fn focus_name(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.name_focus);
+        self.name_cursor = self.form.name.len();
+        self.name_fresh = !self.name_manual;
+        cx.notify();
+    }
+
+    fn name_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        if matches!(key, "enter" | "escape") {
+            window.blur();
+            cx.notify();
+            return;
+        }
+        if self.name_fresh && !matches!(key, "left" | "right" | "home" | "end") {
+            self.form.name.clear();
+            self.name_cursor = 0;
+            self.name_fresh = false;
+            self.name_manual = true;
+        }
+        match key {
+            "backspace" => {
+                if self.name_cursor > 0 {
+                    let start = prev_boundary(&self.form.name, self.name_cursor);
+                    self.form.name.replace_range(start..self.name_cursor, "");
+                    self.name_cursor = start;
+                }
+            }
+            "delete" => {
+                if self.name_cursor < self.form.name.len() {
+                    let end = next_boundary(&self.form.name, self.name_cursor);
+                    self.form.name.replace_range(self.name_cursor..end, "");
+                }
+            }
+            "left" => {
+                self.name_cursor = prev_boundary(&self.form.name, self.name_cursor);
+            }
+            "right" => {
+                self.name_cursor = next_boundary(&self.form.name, self.name_cursor);
+            }
+            "home" => self.name_cursor = 0,
+            "end" => self.name_cursor = self.form.name.len(),
+            "space" => {
+                if !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform {
+                    self.form.name.insert(self.name_cursor, ' ');
+                    self.name_cursor += 1;
+                    self.name_manual = true;
+                }
+            }
+            _ => {
+                if !event.keystroke.modifiers.control && !event.keystroke.modifiers.platform {
+                    if let Some(text) = &event.keystroke.key_char {
+                        let mut changed = false;
+                        for ch in text.chars() {
+                            if ch.is_alphanumeric() || matches!(ch, '.' | '-' | '_' | ' ') {
+                                self.form.name.insert(self.name_cursor, ch);
+                                self.name_cursor += ch.len_utf8();
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            self.name_manual = true;
+                        }
+                    }
+                }
+            }
+        }
+        cx.notify();
     }
 
     fn form_select_profile(&mut self, id: &'static str, cx: &mut Context<Self>) {
@@ -374,9 +589,9 @@ impl VmmApp {
         cx.notify();
     }
 
-    fn form_select_iso(&mut self, idx: Option<usize>, cx: &mut Context<Self>) {
-        self.form.iso = idx;
-        if let Some(path) = idx.and_then(|i| self.form.isos.get(i)) {
+    fn form_select_iso(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.form.iso = path;
+        if let Some(path) = self.form.iso.as_ref() {
             let (profile, version) = osdata::detect_from_iso(&path.to_string_lossy());
             self.form.profile_id = profile.id.to_string();
             self.form.version = version;
@@ -395,22 +610,39 @@ impl VmmApp {
 
     fn form_rescan(&mut self, cx: &mut Context<Self>) {
         self.form.isos = backend::iso_files();
-        if self
-            .form
-            .iso
-            .map(|i| i >= self.form.isos.len())
-            .unwrap_or(false)
-        {
-            self.form.iso = None;
+        if let Some(path) = self.form.iso.as_ref() {
+            if !path.exists() {
+                self.form.iso = None;
+            }
         }
-        self.set_status(
-            format!(
-                "{} ISO file(s) found in ~/VirtualMachines/iso",
-                self.form.isos.len()
-            ),
-            StatusKind::Info,
-        );
+        let key = if self.form.isos.is_empty() {
+            "status.no_iso"
+        } else {
+            "status.iso_found"
+        };
+        let msg = self.tf(key, &[("n", self.form.isos.len().to_string())]);
+        self.set_status(msg, StatusKind::Info);
         cx.notify();
+    }
+
+    fn form_pick_iso(&mut self, cx: &mut Context<Self>) {
+        let title = self.t("cr.choose_iso").to_string();
+        let start = backend::home_dir().join("VirtualMachines").join("iso");
+        cx.spawn(async move |this, cx| {
+            let picked = rfd::AsyncFileDialog::new()
+                .add_filter("ISO", &["iso"])
+                .set_title(title)
+                .set_directory(start)
+                .pick_file()
+                .await;
+            if let Some(file) = picked {
+                let path = file.path().to_path_buf();
+                let _ = this.update(cx, |this, cx| {
+                    this.form_select_iso(Some(path), cx);
+                });
+            }
+        })
+        .detach();
     }
 
     fn form_step(&mut self, field: HwField, delta: i32, cx: &mut Context<Self>) {
@@ -434,30 +666,48 @@ impl VmmApp {
     }
 
     fn create_vm(&mut self, cx: &mut Context<Self>) {
-        let Some(b) = self.backend.as_ref() else {
-            self.set_status("Not connected to libvirt", StatusKind::Error);
+        let name = self.form.name.trim().to_string();
+        if name.is_empty() {
+            self.set_status(self.t("cr.name_empty").to_string(), StatusKind::Error);
             cx.notify();
             return;
-        };
-        let name = self.form.name.clone();
-        let profile = osdata::find(&self.form.profile_id);
+        }
+        if self.vms.iter().any(|vm| vm.name == name) {
+            let msg = self.tf("cr.name_taken", &[("name", name.clone())]);
+            self.set_status(msg, StatusKind::Error);
+            cx.notify();
+            return;
+        }
         let iso = self
             .form
             .iso
-            .and_then(|i| self.form.isos.get(i))
-            .map(|p| p.to_string_lossy().to_string())
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_default();
+        let profile = osdata::find(&self.form.profile_id);
         let (vcpu, ram, disk, kvm) = (self.form.vcpu, self.form.ram, self.form.disk, self.form.kvm);
-        match b.create_vm(&name, profile, vcpu, ram, disk, &iso, kvm) {
+        let res = {
+            let Some(b) = self.backend.as_ref() else {
+                self.set_status(self.t("err.not_connected").to_string(), StatusKind::Error);
+                cx.notify();
+                return;
+            };
+            b.create_vm(&name, profile, vcpu, ram, disk, &iso, kvm)
+        };
+        match res {
             Ok(()) => {
                 self.selected = Some(name.clone());
                 self.screen = Screen::Vms;
                 self.tab = Tab::Overview;
                 self.refresh();
                 self.load_details();
-                self.set_status(format!("Created {name}"), StatusKind::Ok);
+                let msg = self.tf("cr.created", &[("name", name.clone())]);
+                self.set_status(msg, StatusKind::Ok);
             }
-            Err(e) => self.set_status(format!("Create failed: {e}"), StatusKind::Error),
+            Err(e) => {
+                let msg = self.tf("cr.create_failed", &[("error", e.to_string())]);
+                self.set_status(msg, StatusKind::Error);
+            }
         }
         cx.notify();
     }
@@ -468,7 +718,7 @@ impl VmmApp {
         };
         let res = {
             let Some(b) = self.backend.as_ref() else {
-                self.set_status("Not connected to libvirt", StatusKind::Error);
+                self.set_status(self.t("err.not_connected").to_string(), StatusKind::Error);
                 cx.notify();
                 return;
             };
@@ -484,14 +734,19 @@ impl VmmApp {
         };
         match res {
             Ok(()) => {
-                let msg = match action {
-                    VmAction::Start => format!("Starting {name}"),
-                    VmAction::Shutdown => format!("Shutdown requested for {name}"),
-                    VmAction::ForceOff => format!("{name} powered off"),
-                    VmAction::Reboot => format!("Rebooting {name}"),
-                    VmAction::Pause => format!("{name} paused"),
-                    VmAction::Resume => format!("{name} resumed"),
-                    VmAction::Console => "Console launched".to_string(),
+                let key = match action {
+                    VmAction::Start => "status.starting",
+                    VmAction::Shutdown => "status.shutdown_requested",
+                    VmAction::ForceOff => "status.powered_off",
+                    VmAction::Reboot => "status.rebooting",
+                    VmAction::Pause => "status.paused",
+                    VmAction::Resume => "status.resumed",
+                    VmAction::Console => "status.console",
+                };
+                let msg = if matches!(action, VmAction::Console) {
+                    self.t(key).to_string()
+                } else {
+                    self.tf(key, &[("name", name.clone())])
                 };
                 self.set_status(msg, StatusKind::Ok);
                 if !matches!(action, VmAction::Console) {
@@ -504,7 +759,7 @@ impl VmmApp {
         cx.notify();
     }
 
-    fn delete_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn delete_selected(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(name) = self.selected.clone() else {
             return;
         };
@@ -514,27 +769,20 @@ impl VmmApp {
             .unwrap_or(false);
         if running {
             self.set_status(
-                "Stop the virtual machine before deleting it",
+                self.t("status.stop_before_delete").to_string(),
                 StatusKind::Error,
             );
             cx.notify();
             return;
         }
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            &format!("Delete {name}?"),
-            Some("The VM definition and NVRAM will be removed. Disk files stay on disk."),
-            &["Delete", "Cancel"],
-            &mut *cx,
-        );
-        cx.spawn(async move |this, cx| {
-            if let Ok(0) = answer.await {
-                let _ = this.update(cx, |this, cx| {
-                    this.delete_selected_now(&name, cx);
-                });
-            }
-        })
-        .detach();
+        self.confirm = Some(ConfirmDialog {
+            title: self.tf("status.delete_title", &[("name", name.clone())]),
+            body: self.t("status.delete_body").to_string(),
+            confirm: self.t("snap.delete").to_string(),
+            action: ConfirmAction::DeleteVm(name),
+            opened_at: Instant::now(),
+        });
+        cx.notify();
     }
 
     fn delete_selected_now(&mut self, name: &str, cx: &mut Context<Self>) {
@@ -552,9 +800,13 @@ impl VmmApp {
                 self.snaps.clear();
                 self.snap_arm = None;
                 self.refresh();
-                self.set_status(format!("Deleted {name}"), StatusKind::Ok);
+                let msg = self.tf("status.deleted", &[("name", name.to_string())]);
+                self.set_status(msg, StatusKind::Ok);
             }
-            Err(e) => self.set_status(format!("Delete failed: {e}"), StatusKind::Error),
+            Err(e) => {
+                let msg = self.tf("status.delete_failed", &[("error", e.to_string())]);
+                self.set_status(msg, StatusKind::Error);
+            }
         }
         cx.notify();
     }
@@ -632,17 +884,17 @@ impl VmmApp {
         match res {
             Ok(deferred) => {
                 if deferred {
-                    self.set_status(
-                        "Saved. RAM and vCPU changes take effect after the next start.",
-                        StatusKind::Info,
-                    );
+                    self.set_status(self.t("status.hw_deferred").to_string(), StatusKind::Info);
                 } else {
-                    self.set_status("Hardware updated", StatusKind::Ok);
+                    self.set_status(self.t("status.hw_updated").to_string(), StatusKind::Ok);
                 }
                 self.refresh();
                 self.load_details();
             }
-            Err(e) => self.set_status(format!("Apply failed: {e}"), StatusKind::Error),
+            Err(e) => {
+                let msg = self.tf("status.hw_failed", &[("error", e.to_string())]);
+                self.set_status(msg, StatusKind::Error);
+            }
         }
         cx.notify();
     }
@@ -668,9 +920,13 @@ impl VmmApp {
         match res {
             Ok(()) => {
                 self.reload_snaps();
-                self.set_status(format!("Snapshot {snapname} created"), StatusKind::Ok);
+                let msg = self.tf("snap.created", &[("name", snapname.clone())]);
+                self.set_status(msg, StatusKind::Ok);
             }
-            Err(e) => self.set_status(format!("Snapshot failed: {e}"), StatusKind::Error),
+            Err(e) => {
+                let msg = self.tf("snap.failed", &[("error", e.to_string())]);
+                self.set_status(msg, StatusKind::Error);
+            }
         }
         cx.notify();
     }
@@ -697,14 +953,240 @@ impl VmmApp {
         match res {
             Ok(()) => {
                 let msg = match &action {
-                    SnapArm::Revert(snap) => format!("Reverted to {snap}"),
-                    SnapArm::Delete(snap) => format!("Deleted snapshot {snap}"),
+                    SnapArm::Revert(snap) => self.tf("snap.reverted", &[("name", snap.clone())]),
+                    SnapArm::Delete(snap) => self.tf("snap.deleted", &[("name", snap.clone())]),
                 };
                 self.set_status(msg, StatusKind::Ok);
                 self.reload_snaps();
                 self.refresh();
             }
-            Err(e) => self.set_status(format!("Snapshot operation failed: {e}"), StatusKind::Error),
+            Err(e) => {
+                let msg = self.tf("snap.op_failed", &[("error", e.to_string())]);
+                self.set_status(msg, StatusKind::Error);
+            }
+        }
+        cx.notify();
+    }
+
+    fn disk_toggle_add(&mut self, cx: &mut Context<Self>) {
+        self.disk_add_open = !self.disk_add_open;
+        cx.notify();
+    }
+
+    fn disk_size_step(&mut self, delta: i32, cx: &mut Context<Self>) {
+        self.disk_add_size = (self.disk_add_size as i32 + delta * 5).clamp(5, 2000) as u32;
+        cx.notify();
+    }
+
+    fn disk_bus_cycle(&mut self, cx: &mut Context<Self>) {
+        self.disk_add_bus = (self.disk_add_bus + 1) % DISK_BUSES.len();
+        cx.notify();
+    }
+
+    fn disk_add(&mut self, cx: &mut Context<Self>) {
+        let Some(name) = self.selected.clone() else {
+            return;
+        };
+        let size = self.disk_add_size;
+        let bus = DISK_BUSES[self.disk_add_bus];
+        let res = {
+            let Some(b) = self.backend.as_ref() else {
+                self.set_status(self.t("err.not_connected").to_string(), StatusKind::Error);
+                cx.notify();
+                return;
+            };
+            b.add_disk(&name, size, bus)
+        };
+        match res {
+            Ok(target) => {
+                let msg = self.tf(
+                    "disk.added",
+                    &[("target", target.clone()), ("size", size.to_string())],
+                );
+                self.set_status(msg, StatusKind::Ok);
+                self.disk_add_open = false;
+                self.load_details();
+            }
+            Err(e) => {
+                let msg = self.tf("disk.add_failed", &[("error", e.to_string())]);
+                self.set_status(msg, StatusKind::Error);
+            }
+        }
+        cx.notify();
+    }
+
+    fn disk_remove(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(target) = self.disks_sel.clone() else {
+            self.set_status(self.t("disk.select_hint").to_string(), StatusKind::Info);
+            cx.notify();
+            return;
+        };
+        self.confirm = Some(ConfirmDialog {
+            title: self.tf("disk.remove_title", &[("target", target.clone())]),
+            body: self.t("disk.remove_body").to_string(),
+            confirm: self.t("snap.delete").to_string(),
+            action: ConfirmAction::RemoveDisk(target),
+            opened_at: Instant::now(),
+        });
+        cx.notify();
+    }
+
+    fn disk_remove_now(&mut self, target: &str, cx: &mut Context<Self>) {
+        let Some(name) = self.selected.clone() else {
+            return;
+        };
+        let res = {
+            let Some(b) = self.backend.as_ref() else {
+                return;
+            };
+            b.remove_disk(&name, target)
+        };
+        match res {
+            Ok(()) => {
+                let msg = self.tf("disk.removed", &[("target", target.to_string())]);
+                self.set_status(msg, StatusKind::Ok);
+                self.load_details();
+            }
+            Err(e) => {
+                let msg = self.tf("disk.remove_failed", &[("error", e.to_string())]);
+                self.set_status(msg, StatusKind::Error);
+            }
+        }
+        cx.notify();
+    }
+
+    fn iso_attach_pick(&mut self, cx: &mut Context<Self>) {
+        let title = self.t("disk.attach_iso").to_string();
+        let start = backend::home_dir().join("VirtualMachines").join("iso");
+        cx.spawn(async move |this, cx| {
+            let picked = rfd::AsyncFileDialog::new()
+                .add_filter("ISO", &["iso"])
+                .set_title(title)
+                .set_directory(start)
+                .pick_file()
+                .await;
+            if let Some(file) = picked {
+                let path = file.path().to_path_buf();
+                let _ = this.update(cx, |this, cx| this.iso_attach_now(path, cx));
+            }
+        })
+        .detach();
+    }
+
+    fn iso_attach_now(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(name) = self.selected.clone() else {
+            return;
+        };
+        let res = {
+            let Some(b) = self.backend.as_ref() else {
+                return;
+            };
+            b.attach_iso(&name, Some(&path.to_string_lossy()))
+        };
+        match res {
+            Ok(()) => {
+                self.set_status(self.t("disk.iso_attached").to_string(), StatusKind::Ok);
+                self.load_details();
+            }
+            Err(e) => {
+                let msg = self.tf("disk.iso_failed", &[("error", e.to_string())]);
+                self.set_status(msg, StatusKind::Error);
+            }
+        }
+        cx.notify();
+    }
+
+    fn iso_eject(&mut self, cx: &mut Context<Self>) {
+        let Some(name) = self.selected.clone() else {
+            return;
+        };
+        let res = {
+            let Some(b) = self.backend.as_ref() else {
+                return;
+            };
+            b.attach_iso(&name, None)
+        };
+        match res {
+            Ok(()) => {
+                self.set_status(self.t("disk.iso_ejected").to_string(), StatusKind::Ok);
+                self.load_details();
+            }
+            Err(e) => {
+                let msg = self.tf("disk.iso_failed", &[("error", e.to_string())]);
+                self.set_status(msg, StatusKind::Error);
+            }
+        }
+        cx.notify();
+    }
+
+    fn nic_model_cycle(&mut self, cx: &mut Context<Self>) {
+        self.nic_model = (self.nic_model + 1) % NIC_MODELS.len();
+        cx.notify();
+    }
+
+    fn nic_add(&mut self, cx: &mut Context<Self>) {
+        let Some(name) = self.selected.clone() else {
+            return;
+        };
+        let model = NIC_MODELS[self.nic_model];
+        let res = {
+            let Some(b) = self.backend.as_ref() else {
+                self.set_status(self.t("err.not_connected").to_string(), StatusKind::Error);
+                cx.notify();
+                return;
+            };
+            b.add_nic(&name, model)
+        };
+        match res {
+            Ok(mac) => {
+                let msg = self.tf("net.added", &[("mac", mac)]);
+                self.set_status(msg, StatusKind::Ok);
+                self.load_details();
+            }
+            Err(e) => {
+                let msg = self.tf("net.add_failed", &[("error", e.to_string())]);
+                self.set_status(msg, StatusKind::Error);
+            }
+        }
+        cx.notify();
+    }
+
+    fn nic_remove(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mac) = self.nics_sel.clone() else {
+            self.set_status(self.t("net.select_hint").to_string(), StatusKind::Info);
+            cx.notify();
+            return;
+        };
+        self.confirm = Some(ConfirmDialog {
+            title: self.tf("net.remove_title", &[("mac", mac.clone())]),
+            body: self.t("net.remove_body").to_string(),
+            confirm: self.t("snap.delete").to_string(),
+            action: ConfirmAction::RemoveNic(mac),
+            opened_at: Instant::now(),
+        });
+        cx.notify();
+    }
+
+    fn nic_remove_now(&mut self, mac: &str, cx: &mut Context<Self>) {
+        let Some(name) = self.selected.clone() else {
+            return;
+        };
+        let res = {
+            let Some(b) = self.backend.as_ref() else {
+                return;
+            };
+            b.remove_nic(&name, mac)
+        };
+        match res {
+            Ok(()) => {
+                let msg = self.tf("net.removed", &[("mac", mac.to_string())]);
+                self.set_status(msg, StatusKind::Ok);
+                self.load_details();
+            }
+            Err(e) => {
+                let msg = self.tf("net.remove_failed", &[("error", e.to_string())]);
+                self.set_status(msg, StatusKind::Error);
+            }
         }
         cx.notify();
     }
@@ -712,6 +1194,7 @@ impl VmmApp {
     fn nav(&mut self, screen: Screen, cx: &mut Context<Self>) {
         if screen == Screen::Create {
             self.form_sync_name();
+            self.name_focus_pending = true;
         }
         self.screen = screen;
         cx.notify();
@@ -731,20 +1214,29 @@ impl VmmApp {
 
     fn screen_text(&self) -> (&'static str, String) {
         let running = self.vms.iter().filter(|v| v.running()).count();
-        match self.screen {
-            Screen::Vms => (
-                "Virtual Machines",
-                format!("{} total · {} running", self.vms.len(), running),
+        let title = match self.screen {
+            Screen::Vms => self.t("title.vms"),
+            Screen::Create => self.t("title.create"),
+            Screen::Storage => self.t("title.storage"),
+            Screen::Networks => self.t("title.networks"),
+            Screen::Ssh => self.t("title.ssh"),
+            Screen::Settings => self.t("title.settings"),
+        };
+        let subtitle = match self.screen {
+            Screen::Vms => self.tf(
+                "subtitle.vms",
+                &[
+                    ("n", self.vms.len().to_string()),
+                    ("running", running.to_string()),
+                ],
             ),
-            Screen::Create => (
-                "Create Virtual Machine",
-                "One screen, sensible defaults".into(),
-            ),
-            Screen::Storage => ("Storage Pools", "libvirt storage volumes".into()),
-            Screen::Networks => ("Networks", "Virtual networks and bridges".into()),
-            Screen::Ssh => ("SSH Hosts", "Remote hypervisors and consoles".into()),
-            Screen::Settings => ("Settings", "Application preferences".into()),
-        }
+            Screen::Create => self.t("subtitle.create").to_string(),
+            Screen::Storage => self.t("subtitle.storage").to_string(),
+            Screen::Networks => self.t("subtitle.networks").to_string(),
+            Screen::Ssh => self.t("subtitle.ssh").to_string(),
+            Screen::Settings => self.t("subtitle.settings").to_string(),
+        };
+        (title, subtitle)
     }
 
     fn sidebar(&self, cx: &mut Context<Self>) -> Div {
@@ -753,7 +1245,7 @@ impl VmmApp {
                 let label = if b.is_session() { "session" } else { "system" };
                 format!("libvirt · {label}")
             }
-            None => "offline".to_string(),
+            None => self.t("conn.offline").to_string(),
         };
         let conn_color = if self.backend.is_some() {
             col(GREEN)
@@ -782,16 +1274,55 @@ impl VmmApp {
                     .pb(px(14.))
                     .child(
                         div()
-                            .size(px(32.))
+                            .w(px(34.))
+                            .h(px(34.))
                             .rounded(px(8.))
                             .bg(col(ACCENT))
+                            .flex_shrink_0()
                             .flex()
+                            .flex_col()
                             .items_center()
                             .justify_center()
-                            .text_color(col(0x062a26))
-                            .font_weight(FontWeight::BOLD)
-                            .text_size(px(16.))
-                            .child("V"),
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .w(px(20.))
+                                    .h(px(13.))
+                                    .rounded(px(3.))
+                                    .bg(col(BG))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(2.))
+                                    .px(px(3.))
+                                    .child(dot(col(ACCENT), 3.0))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap(px(1.5))
+                                            .child(
+                                                div()
+                                                    .w(px(8.))
+                                                    .h(px(1.5))
+                                                    .rounded(px(0.75))
+                                                    .bg(col(ACCENT)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w(px(6.))
+                                                    .h(px(1.5))
+                                                    .rounded(px(0.75))
+                                                    .bg(alpha(col(ACCENT), 0.6)),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w(px(16.))
+                                    .h(px(3.))
+                                    .rounded(px(1.5))
+                                    .bg(alpha(col(BG), 0.55)),
+                            ),
                     )
                     .child(
                         div()
@@ -807,23 +1338,35 @@ impl VmmApp {
                                 div()
                                     .text_size(px(10.))
                                     .text_color(col(MUTED))
-                                    .child("QEMU / KVM manager"),
+                                    .child(self.t("app.tagline")),
                             ),
                     ),
             )
-            .child(self.nav_item("nav_vms", "Virtual Machines", "▣", Screen::Vms, cx))
+            .child(self.nav_item("nav_vms", self.t("nav.vms"), "▣", Screen::Vms, cx))
+            .child(self.nav_item("nav_create", self.t("nav.new"), "＋", Screen::Create, cx))
+            .child(div().h(px(10.)))
             .child(self.nav_item(
-                "nav_create",
-                "New Virtual Machine",
-                "＋",
-                Screen::Create,
+                "nav_storage",
+                self.t("nav.storage"),
+                "▤",
+                Screen::Storage,
                 cx,
             ))
-            .child(div().h(px(10.)))
-            .child(self.nav_item("nav_storage", "Storage Pools", "▤", Screen::Storage, cx))
-            .child(self.nav_item("nav_networks", "Networks", "⇄", Screen::Networks, cx))
-            .child(self.nav_item("nav_ssh", "SSH Hosts", "⌗", Screen::Ssh, cx))
-            .child(self.nav_item("nav_settings", "Settings", "⚙", Screen::Settings, cx))
+            .child(self.nav_item(
+                "nav_networks",
+                self.t("nav.networks"),
+                "⇄",
+                Screen::Networks,
+                cx,
+            ))
+            .child(self.nav_item("nav_ssh", self.t("nav.ssh"), "⌗", Screen::Ssh, cx))
+            .child(self.nav_item(
+                "nav_settings",
+                self.t("nav.settings"),
+                "⚙",
+                Screen::Settings,
+                cx,
+            ))
             .child(div().flex_1())
             .child(
                 div()
@@ -840,7 +1383,7 @@ impl VmmApp {
                             .text_size(px(9.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(col(MUTED))
-                            .child("HYPERVISOR"),
+                            .child(self.t("hypervisor")),
                     )
                     .child(
                         div()
@@ -868,9 +1411,9 @@ impl VmmApp {
                             .child(dot(if self.kvm_ok { col(GREEN) } else { col(AMBER) }, 6.0))
                             .child(div().text_size(px(11.)).text_color(col(MUTED)).child(
                                 if self.kvm_ok {
-                                    "KVM available"
+                                    self.t("kvm.available")
                                 } else {
-                                    "KVM unavailable"
+                                    self.t("kvm.unavailable")
                                 },
                             )),
                     ),
@@ -911,7 +1454,7 @@ impl VmmApp {
             .hover(|this| this.bg(col(CARD)).text_color(col(TEXT)))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.nav(screen, cx)))
             .child(div().w(px(18.)).flex().justify_center().child(glyph))
-            .child(label)
+            .child(div().flex_1().min_w(px(0.)).truncate().child(label))
     }
 
     fn toolbar(&self, cx: &mut Context<Self>) -> Div {
@@ -970,58 +1513,69 @@ impl VmmApp {
                             ))
                             .child(div().text_size(px(11.)).text_color(col(MUTED)).child(
                                 if self.backend.is_some() {
-                                    "connected"
+                                    self.t("tb.connected")
                                 } else {
-                                    "offline"
+                                    self.t("tb.offline")
                                 },
                             )),
                     )
                     .child(
-                        button("tb_refresh", "Refresh", BtnKind::Normal).on_click(cx.listener(
-                            |this, _: &ClickEvent, _, cx| {
-                                this.refresh();
-                                this.set_status("Refreshed", StatusKind::Info);
-                                cx.notify();
-                            },
-                        )),
+                        button("tb_lang", i18n::short(self.lang), BtnKind::Normal).on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.cycle_lang(cx)),
+                        ),
                     )
-                    .child(button("tb_new", "＋ New VM", BtnKind::Accent).on_click(
-                        cx.listener(|this, _: &ClickEvent, _, cx| this.nav(Screen::Create, cx)),
-                    )),
+                    .child(
+                        button("tb_refresh", self.t("tb.refresh"), BtnKind::Normal).on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.refresh();
+                                this.set_status(
+                                    this.t("status.refreshed").to_string(),
+                                    StatusKind::Info,
+                                );
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        button(
+                            "tb_new",
+                            &format!("＋ {}", self.t("tb.new")),
+                            BtnKind::Accent,
+                        )
+                        .on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.nav(Screen::Create, cx)),
+                        ),
+                    ),
             )
     }
 
-    fn body(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn body(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.backend.is_none() {
             return self.connection_error(cx).into_any_element();
         }
         match self.screen {
             Screen::Vms => self.vms_screen(cx).into_any_element(),
-            Screen::Create => self.create_screen(cx).into_any_element(),
-            Screen::Storage => self.placeholder(
-                "▤",
-                "Storage pools",
-                "Manage libvirt storage pools and volumes here. The core build only manages VM disks in ~/VirtualMachines/vms.",
-                cx,
-            ).into_any_element(),
-            Screen::Networks => self.placeholder(
-                "⇄",
-                "Virtual networks",
-                "Browse libvirt networks and bridges here. Session VMs use user-mode networking for zero configuration.",
-                cx,
-            ).into_any_element(),
-            Screen::Ssh => self.placeholder(
-                "⌗",
-                "SSH hosts",
-                "Connect to remote libvirt daemons over SSH. This screen is planned for the next build.",
-                cx,
-            ).into_any_element(),
-            Screen::Settings => self.placeholder(
-                "⚙",
-                "Settings",
-                "Language, default paths and console preferences will live here. The core build keeps things simple.",
-                cx,
-            ).into_any_element(),
+            Screen::Create => self.create_screen(window, cx).into_any_element(),
+            Screen::Storage => self
+                .placeholder(
+                    "▤",
+                    self.t("ph.storage_title"),
+                    self.t("ph.storage_body"),
+                    cx,
+                )
+                .into_any_element(),
+            Screen::Networks => self
+                .placeholder(
+                    "⇄",
+                    self.t("ph.networks_title"),
+                    self.t("ph.networks_body"),
+                    cx,
+                )
+                .into_any_element(),
+            Screen::Ssh => self
+                .placeholder("⌗", self.t("ph.ssh_title"), self.t("ph.ssh_body"), cx)
+                .into_any_element(),
+            Screen::Settings => self.settings_screen(cx).into_any_element(),
         }
     }
 
@@ -1050,13 +1604,13 @@ impl VmmApp {
                         div()
                             .text_size(px(18.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("Cannot connect to libvirt"),
+                            .child(self.t("conn.title")),
                     )
                     .child(
                         div()
                             .text_size(px(12.))
                             .text_color(col(MUTED))
-                            .child("Install libvirt, qemu and virt-viewer, then make sure the libvirt session daemon can start."),
+                            .child(self.t("conn.body")),
                     )
                     .child(
                         div()
@@ -1067,14 +1621,11 @@ impl VmmApp {
                             .text_color(col(RED))
                             .child(detail),
                     )
-                    .child(
-                        div().flex().gap(px(8.)).child(
-                            button("retry_conn", "Retry connection", BtnKind::Accent)
-                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.reconnect(cx)
-                                })),
+                    .child(div().flex().gap(px(8.)).child(
+                        button("retry_conn", self.t("conn.retry"), BtnKind::Accent).on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.reconnect(cx)),
                         ),
-                    ),
+                    )),
             )
     }
 
@@ -1099,20 +1650,28 @@ impl VmmApp {
                             .justify_between()
                             .pb(px(12.))
                             .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .text_color(col(MUTED))
-                                    .child(format!(
-                                        "{} machine(s), {} running",
-                                        self.vms.len(),
-                                        self.vms.iter().filter(|v| v.running()).count()
-                                    )),
+                                div().text_size(px(13.)).text_color(col(MUTED)).child(
+                                    self.tf(
+                                        "list.summary",
+                                        &[
+                                            ("n", self.vms.len().to_string()),
+                                            (
+                                                "running",
+                                                self.vms
+                                                    .iter()
+                                                    .filter(|v| v.running())
+                                                    .count()
+                                                    .to_string(),
+                                            ),
+                                        ],
+                                    ),
+                                ),
                             )
                             .child(
                                 div()
                                     .text_size(px(11.))
                                     .text_color(col(MUTED))
-                                    .child("click a card to inspect"),
+                                    .child(self.t("list.hint")),
                             ),
                     )
                     .child(
@@ -1169,18 +1728,23 @@ impl VmmApp {
                                     .truncate()
                                     .child(vm.name.clone()),
                             )
-                            .child(state_badge(vm)),
+                            .child(self.state_badge(vm)),
                     )
                     .child(
                         div()
                             .text_size(px(11.))
                             .text_color(col(MUTED))
                             .child(format!(
-                                "{} · {} vCPU · {} RAM · {} disk",
+                                "{} · {}",
                                 profile.name,
-                                vm.vcpus,
-                                fmt_mb(vm.maxmem_mb),
-                                fmt_disk(vm.disk_gb)
+                                self.tf(
+                                    "vm.spec",
+                                    &[
+                                        ("vcpu", vm.vcpus.to_string()),
+                                        ("ram", fmt_mb(vm.maxmem_mb)),
+                                        ("disk", fmt_disk(vm.disk_gb)),
+                                    ],
+                                )
                             )),
                     ),
             )
@@ -1251,7 +1815,7 @@ impl VmmApp {
 
     fn details_panel(&self, cx: &mut Context<Self>) -> Div {
         div()
-            .w(px(388.))
+            .w(px(410.))
             .h_full()
             .flex_shrink_0()
             .flex()
@@ -1264,9 +1828,11 @@ impl VmmApp {
                     .flex()
                     .border_b_1()
                     .border_color(col(BORDER))
-                    .child(self.tab_button(Tab::Overview, "Overview", cx))
-                    .child(self.tab_button(Tab::Hardware, "Hardware", cx))
-                    .child(self.tab_button(Tab::Snapshots, "Snapshots", cx)),
+                    .child(self.tab_button(Tab::Overview, self.t("tab.overview"), cx))
+                    .child(self.tab_button(Tab::Hardware, self.t("tab.hardware"), cx))
+                    .child(self.tab_button(Tab::Disks, self.t("tab.disks"), cx))
+                    .child(self.tab_button(Tab::Network, self.t("tab.network"), cx))
+                    .child(self.tab_button(Tab::Snapshots, self.t("tab.snapshots"), cx)),
             )
             .child(
                 div()
@@ -1275,11 +1841,13 @@ impl VmmApp {
                     .min_h(px(0.))
                     .overflow_y_scroll()
                     .p(px(16.))
-                    .child(match self.tab {
+                    .child(div().w_full().child(match self.tab {
                         Tab::Overview => self.overview_tab(cx),
                         Tab::Hardware => self.hardware_tab(cx),
+                        Tab::Disks => self.disks_tab(cx),
+                        Tab::Network => self.network_tab(cx),
                         Tab::Snapshots => self.snapshots_tab(cx),
-                    }),
+                    })),
             )
     }
 
@@ -1289,6 +1857,8 @@ impl VmmApp {
             .id(match tab {
                 Tab::Overview => "tab_overview",
                 Tab::Hardware => "tab_hardware",
+                Tab::Disks => "tab_disks",
+                Tab::Network => "tab_network",
                 Tab::Snapshots => "tab_snapshots",
             })
             .flex_1()
@@ -1297,7 +1867,7 @@ impl VmmApp {
             .py(px(11.))
             .border_b_1()
             .border_color(if active { col(ACCENT) } else { col(BORDER) })
-            .text_size(px(12.))
+            .text_size(px(11.))
             .font_weight(FontWeight::MEDIUM)
             .text_color(if active { col(ACCENT) } else { col(MUTED) })
             .cursor_pointer()
@@ -1316,15 +1886,19 @@ impl VmmApp {
         let profile = vm.os();
         let hw = self.hw.as_ref();
         let vcpu_value = if vm.running() && vm.live_vcpus != vm.vcpus {
-            format!("{} (now {})", vm.vcpus, vm.live_vcpus)
+            format!(
+                "{} ({})",
+                vm.vcpus,
+                self.tf("ov.now", &[("value", vm.live_vcpus.to_string())])
+            )
         } else {
             vm.vcpus.to_string()
         };
         let ram_value = if vm.running() && vm.live_maxmem_mb != vm.maxmem_mb {
             format!(
-                "{} (now {})",
+                "{} ({})",
                 fmt_mb(vm.maxmem_mb),
-                fmt_mb(vm.live_maxmem_mb)
+                self.tf("ov.now", &[("value", fmt_mb(vm.live_maxmem_mb))])
             )
         } else {
             fmt_mb(vm.maxmem_mb)
@@ -1333,35 +1907,43 @@ impl VmmApp {
         let uefi = hw
             .map(|h| if h.uefi { "UEFI" } else { "BIOS" })
             .unwrap_or("—");
-        let tpm = hw.map(|h| if h.tpm { "yes" } else { "no" }).unwrap_or("—");
+        let tpm = hw
+            .map(|h| {
+                if h.tpm {
+                    self.t("ov.yes")
+                } else {
+                    self.t("ov.no")
+                }
+            })
+            .unwrap_or("—");
         let video = hw.map(|h| h.video.clone()).unwrap_or_else(|| "—".into());
 
         let mut actions: Vec<Stateful<Div>> = Vec::new();
         if vm.running() {
             actions.push(self.action_button(
                 "act_shutdown",
-                "Shut down",
+                self.t("act.shutdown"),
                 BtnKind::Normal,
                 VmAction::Shutdown,
                 cx,
             ));
             actions.push(self.action_button(
                 "act_force",
-                "Force off",
+                self.t("act.forceoff"),
                 BtnKind::Danger,
                 VmAction::ForceOff,
                 cx,
             ));
             actions.push(self.action_button(
                 "act_reboot",
-                "Reboot",
+                self.t("act.reboot"),
                 BtnKind::Normal,
                 VmAction::Reboot,
                 cx,
             ));
             actions.push(self.action_button(
                 "act_pause",
-                "Pause",
+                self.t("act.pause"),
                 BtnKind::Normal,
                 VmAction::Pause,
                 cx,
@@ -1369,14 +1951,14 @@ impl VmmApp {
         } else if vm.paused() {
             actions.push(self.action_button(
                 "act_resume2",
-                "Resume",
+                self.t("act.resume"),
                 BtnKind::Accent,
                 VmAction::Resume,
                 cx,
             ));
             actions.push(self.action_button(
                 "act_force2",
-                "Force off",
+                self.t("act.forceoff"),
                 BtnKind::Danger,
                 VmAction::ForceOff,
                 cx,
@@ -1384,7 +1966,7 @@ impl VmmApp {
         } else {
             actions.push(self.action_button(
                 "act_start",
-                "Start",
+                self.t("act.start"),
                 BtnKind::Accent,
                 VmAction::Start,
                 cx,
@@ -1392,7 +1974,7 @@ impl VmmApp {
         }
         actions.push(self.action_button(
             "act_console",
-            "Console",
+            self.t("act.console"),
             BtnKind::Normal,
             VmAction::Console,
             cx,
@@ -1424,7 +2006,7 @@ impl VmmApp {
                                     .flex()
                                     .items_center()
                                     .gap(px(8.))
-                                    .child(state_badge(vm))
+                                    .child(self.state_badge(vm))
                                     .child(
                                         div()
                                             .text_size(px(11.))
@@ -1438,24 +2020,31 @@ impl VmmApp {
                 div()
                     .flex()
                     .flex_col()
-                    .child(self.info_row("Operating system", profile.name))
-                    .child(self.info_row("State", state_name(vm)))
-                    .child(self.info_row("vCPU", vcpu_value))
-                    .child(self.info_row("Memory", ram_value))
-                    .child(self.info_row("Disk", fmt_disk(vm.disk_gb)))
-                    .child(self.info_row("Machine", machine))
-                    .child(self.info_row("Firmware", uefi))
-                    .child(self.info_row("TPM", tpm))
-                    .child(self.info_row("Video", video))
-                    .child(self.info_row("Autostart", if vm.autostart { "on" } else { "off" }))
-                    .child(self.info_row("Console", "SPICE")),
+                    .child(self.info_row(self.t("ov.os"), profile.name))
+                    .child(self.info_row(self.t("ov.state"), self.state_name(vm)))
+                    .child(self.info_row(self.t("ov.vcpu"), vcpu_value))
+                    .child(self.info_row(self.t("ov.memory"), ram_value))
+                    .child(self.info_row(self.t("ov.disk"), fmt_disk(vm.disk_gb)))
+                    .child(self.info_row(self.t("ov.machine"), machine))
+                    .child(self.info_row(self.t("ov.firmware"), uefi))
+                    .child(self.info_row(self.t("ov.tpm"), tpm))
+                    .child(self.info_row(self.t("ov.video"), video))
+                    .child(self.info_row(
+                        self.t("ov.autostart"),
+                        if vm.autostart {
+                            self.t("ov.on")
+                        } else {
+                            self.t("ov.off")
+                        },
+                    ))
+                    .child(self.info_row(self.t("ov.console"), "SPICE")),
             )
             .child(
                 div()
                     .text_size(px(10.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(col(MUTED))
-                    .child("POWER"),
+                    .child(self.t("ov.power")),
             )
             .child(div().flex().flex_wrap().gap(px(8.)).children(actions))
             .child(div().h(px(4.)))
@@ -1464,11 +2053,11 @@ impl VmmApp {
                     .text_size(px(10.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(col(MUTED))
-                    .child("DANGER ZONE"),
+                    .child(self.t("ov.danger")),
             )
             .child(
                 div().w_full().flex().child(
-                    button("act_delete", "Delete virtual machine", BtnKind::Danger)
+                    button("act_delete", self.t("act.delete_vm"), BtnKind::Danger)
                         .flex_1()
                         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                             this.delete_selected(window, cx)
@@ -1486,7 +2075,7 @@ impl VmmApp {
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
         button(id, label, kind)
-            .w(px(108.))
+            .min_w(px(108.))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.vm_action(action, cx)))
     }
 
@@ -1509,6 +2098,538 @@ impl VmmApp {
                     .text_size(px(11.))
                     .font_weight(FontWeight::MEDIUM)
                     .child(value.into()),
+            )
+    }
+
+    fn disks_tab(&self, cx: &mut Context<Self>) -> Div {
+        let Some(vm) = self.selected_vm() else {
+            return self.no_selection();
+        };
+        let mut rows: Vec<Stateful<Div>> = Vec::new();
+        for disk in &self.disks {
+            let selected = self.disks_sel.as_deref() == Some(disk.target.as_str());
+            let target = disk.target.clone();
+            let file_name = std::path::Path::new(&disk.file)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| disk.file.clone());
+            let size = if disk.device == "cdrom" {
+                self.t("disk.media").to_string()
+            } else {
+                format!("{} GiB", disk.size_gb)
+            };
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("disk-{}", disk.target)))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(10.))
+                    .py(px(7.))
+                    .rounded(px(8.))
+                    .bg(col(if selected { CARD2 } else { CARD }))
+                    .border_1()
+                    .border_color(col(if selected { ACCENT } else { BORDER }))
+                    .cursor_pointer()
+                    .hover(|this| this.border_color(col(ACCENT_D)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.disks_sel = Some(target.clone());
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(46.))
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(col(ACCENT))
+                            .child(disk.target.clone()),
+                    )
+                    .child(
+                        div()
+                            .w(px(44.))
+                            .text_size(px(10.))
+                            .text_color(col(MUTED))
+                            .child(disk.bus.clone()),
+                    )
+                    .child(div().w(px(58.)).text_size(px(10.)).child(size))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(10.))
+                            .text_color(col(MUTED))
+                            .child(file_name),
+                    ),
+            );
+        }
+        let selected_hint = self
+            .disks_sel
+            .as_ref()
+            .map(|target| self.tf("disk.selected", &[("target", target.clone())]))
+            .unwrap_or_else(|| self.t("disk.select_hint").to_string());
+        let mut add_form: Vec<Div> = Vec::new();
+        if self.disk_add_open {
+            add_form.push(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_y(px(6.))
+                    .p(px(10.))
+                    .rounded(px(8.))
+                    .bg(col(CARD))
+                    .border_1()
+                    .border_color(col(BORDER))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.))
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(col(MUTED))
+                                    .child(self.t("disk.size_label")),
+                            )
+                            .child(step_button("disk_size_minus", "−").on_click(cx.listener(
+                                |this, _: &ClickEvent, _, cx| this.disk_size_step(-1, cx),
+                            )))
+                            .child(
+                                div()
+                                    .w(px(62.))
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(format!("{} GiB", self.disk_add_size)),
+                            )
+                            .child(step_button("disk_size_plus", "＋").on_click(cx.listener(
+                                |this, _: &ClickEvent, _, cx| this.disk_size_step(1, cx),
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                step_button(
+                                    "disk_bus",
+                                    &format!(
+                                        "{} {}",
+                                        self.t("disk.bus_label"),
+                                        DISK_BUSES[self.disk_add_bus]
+                                    ),
+                                )
+                                .w(px(96.))
+                                .on_click(cx.listener(
+                                    |this, _: &ClickEvent, _, cx| this.disk_bus_cycle(cx),
+                                )),
+                            )
+                            .child(
+                                button("disk_create", self.t("disk.create"), BtnKind::Accent)
+                                    .on_click(
+                                        cx.listener(|this, _: &ClickEvent, _, cx| {
+                                            this.disk_add(cx)
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                button("disk_cancel", self.t("disk.cancel"), BtnKind::Normal)
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.disk_toggle_add(cx)
+                                    })),
+                            ),
+                    ),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .text_size(px(15.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(self.t("disk.title")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(col(MUTED))
+                                    .child(format!("{} · {}", self.disks.len(), vm.name)),
+                            ),
+                    )
+                    .child(
+                        button("disk_add", self.t("disk.add"), BtnKind::Accent).on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.disk_toggle_add(cx)),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .px(px(10.))
+                    .text_size(px(9.))
+                    .text_color(col(MUTED))
+                    .child(div().w(px(46.)).child(self.t("disk.device")))
+                    .child(div().w(px(44.)).child(self.t("disk.bus")))
+                    .child(div().w(px(58.)).child(self.t("disk.size")))
+                    .child(div().flex_1().child(self.t("disk.file"))),
+            )
+            .child(div().flex().flex_col().gap(px(6.)).children(rows))
+            .child(if self.disks.is_empty() {
+                div()
+                    .py(px(20.))
+                    .text_size(px(11.))
+                    .text_color(col(MUTED))
+                    .child(self.t("disk.none"))
+            } else {
+                div()
+            })
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(col(MUTED))
+                    .child(selected_hint),
+            )
+            .children(add_form)
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(6.))
+                    .child(
+                        button(
+                            "disk_attach_iso",
+                            self.t("disk.attach_iso"),
+                            BtnKind::Normal,
+                        )
+                        .on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.iso_attach_pick(cx)),
+                        ),
+                    )
+                    .child(
+                        button("disk_eject_iso", self.t("disk.eject_iso"), BtnKind::Normal)
+                            .on_click(
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.iso_eject(cx)),
+                            ),
+                    )
+                    .child(
+                        button("disk_remove", self.t("disk.remove"), BtnKind::Danger).on_click(
+                            cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.disk_remove(window, cx)
+                            }),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(col(if vm.running() { AMBER } else { MUTED }))
+                    .child(self.t("disk.running_note")),
+            )
+    }
+
+    fn network_tab(&self, cx: &mut Context<Self>) -> Div {
+        let Some(vm) = self.selected_vm() else {
+            return self.no_selection();
+        };
+        let mut rows: Vec<Stateful<Div>> = Vec::new();
+        for nic in &self.nics {
+            let selected = self.nics_sel.as_deref() == Some(nic.mac.as_str());
+            let mac = nic.mac.clone();
+            let type_label = match nic.iface_type.as_str() {
+                "user" => self.t("net.user").to_string(),
+                "bridge" => self.t("net.bridge").to_string(),
+                _ => self.t("net.network").to_string(),
+            };
+            let source = if nic.source.is_empty() {
+                type_label
+            } else {
+                format!("{type_label} · {}", nic.source)
+            };
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("nic-{}", nic.mac)))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.))
+                    .px(px(10.))
+                    .py(px(7.))
+                    .rounded(px(8.))
+                    .bg(col(if selected { CARD2 } else { CARD }))
+                    .border_1()
+                    .border_color(col(if selected { ACCENT } else { BORDER }))
+                    .cursor_pointer()
+                    .hover(|this| this.border_color(col(ACCENT_D)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.nics_sel = Some(mac.clone());
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(130.))
+                            .text_size(px(10.))
+                            .text_color(col(ACCENT))
+                            .child(nic.mac.clone()),
+                    )
+                    .child(div().w(px(62.)).text_size(px(10.)).child(nic.model.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_size(px(10.))
+                            .text_color(col(MUTED))
+                            .child(source),
+                    ),
+            );
+        }
+        let selected_hint = self
+            .nics_sel
+            .as_ref()
+            .map(|mac| {
+                let value = self
+                    .nics
+                    .iter()
+                    .find(|nic| &nic.mac == mac)
+                    .map(|nic| nic.mac.clone())
+                    .unwrap_or_default();
+                self.tf("disk.selected", &[("target", value)])
+            })
+            .unwrap_or_else(|| self.t("net.select_hint").to_string());
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(10.))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .text_size(px(15.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(self.t("net.title")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(col(MUTED))
+                                    .child(format!("{} · {}", self.nics.len(), vm.name)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .child(
+                                step_button(
+                                    "nic_model",
+                                    &format!(
+                                        "{} {}",
+                                        self.t("net.model_label"),
+                                        NIC_MODELS[self.nic_model]
+                                    ),
+                                )
+                                .w(px(104.))
+                                .on_click(cx.listener(
+                                    |this, _: &ClickEvent, _, cx| this.nic_model_cycle(cx),
+                                )),
+                            )
+                            .child(
+                                button("nic_add", self.t("net.add"), BtnKind::Accent).on_click(
+                                    cx.listener(|this, _: &ClickEvent, _, cx| this.nic_add(cx)),
+                                ),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .px(px(10.))
+                    .text_size(px(9.))
+                    .text_color(col(MUTED))
+                    .child(div().w(px(130.)).child(self.t("net.mac")))
+                    .child(div().w(px(62.)).child(self.t("net.model")))
+                    .child(div().flex_1().child(self.t("net.source"))),
+            )
+            .child(div().flex().flex_col().gap(px(6.)).children(rows))
+            .child(if self.nics.is_empty() {
+                div()
+                    .py(px(20.))
+                    .text_size(px(11.))
+                    .text_color(col(MUTED))
+                    .child(self.t("net.none"))
+            } else {
+                div()
+            })
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(col(MUTED))
+                    .child(selected_hint),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(col(MUTED))
+                            .child(self.t("net.add_hint")),
+                    )
+                    .child(
+                        button("nic_remove", self.t("net.remove"), BtnKind::Danger).on_click(
+                            cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.nic_remove(window, cx)
+                            }),
+                        ),
+                    ),
+            )
+    }
+
+    fn settings_screen(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let mut rows: Vec<Stateful<Div>> = Vec::new();
+        for lang in Lang::ALL {
+            let selected = self.lang == lang;
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("lang-{}", lang.code())))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px(px(12.))
+                    .h(px(40.))
+                    .rounded(px(8.))
+                    .bg(col(if selected { CARD2 } else { CARD }))
+                    .border_1()
+                    .border_color(col(if selected { ACCENT } else { BORDER }))
+                    .cursor_pointer()
+                    .hover(|this| this.border_color(col(ACCENT_D)))
+                    .on_click(
+                        cx.listener(move |this, _: &ClickEvent, _, cx| this.set_lang(lang, cx)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(lang.label()),
+                    )
+                    .child(if selected {
+                        div().w(px(8.)).h(px(8.)).rounded(px(4.)).bg(col(ACCENT))
+                    } else {
+                        div()
+                    }),
+            );
+        }
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .id("settings_scroll")
+            .overflow_y_scroll()
+            .p(px(20.))
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(720.))
+                    .mx_auto()
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.))
+                    .child(
+                        div()
+                            .text_size(px(20.))
+                            .font_weight(FontWeight::BOLD)
+                            .child(self.t("title.settings")),
+                    )
+                    .child(
+                        div()
+                            .p(px(14.))
+                            .rounded(px(10.))
+                            .bg(col(PANEL))
+                            .border_1()
+                            .border_color(col(BORDER))
+                            .flex()
+                            .flex_col()
+                            .gap(px(10.))
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(self.t("set.language")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(col(MUTED))
+                                    .child(self.t("set.language_hint")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(col(ACCENT))
+                                    .child(self.tf(
+                                        "settings.current",
+                                        &[("lang", self.lang.label().to_string())],
+                                    )),
+                            )
+                            .child(div().flex().flex_col().gap(px(6.)).children(rows)),
+                    )
+                    .child(
+                        div()
+                            .p(px(14.))
+                            .rounded(px(10.))
+                            .bg(col(PANEL))
+                            .border_1()
+                            .border_color(col(BORDER))
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .text_size(px(14.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(self.t("set.about")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(col(MUTED))
+                                    .child(self.t("set.about_text")),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(col(MUTED))
+                                    .child(format!(
+                                        "{} {} · {} GPL-3.0",
+                                        self.t("set.version"),
+                                        env!("CARGO_PKG_VERSION"),
+                                        self.t("set.license")
+                                    )),
+                            ),
+                    ),
             )
     }
 
@@ -1568,7 +2689,11 @@ impl VmmApp {
                             .child(
                                 button(
                                     "snap_revert",
-                                    if revert_armed { "Confirm" } else { "Revert" },
+                                    if revert_armed {
+                                        self.t("snap.confirm")
+                                    } else {
+                                        self.t("snap.revert")
+                                    },
                                     if revert_armed {
                                         BtnKind::Accent
                                     } else {
@@ -1585,7 +2710,11 @@ impl VmmApp {
                             .child(
                                 button(
                                     "snap_delete",
-                                    if delete_armed { "Confirm" } else { "Delete" },
+                                    if delete_armed {
+                                        self.t("snap.confirm")
+                                    } else {
+                                        self.t("snap.delete")
+                                    },
                                     BtnKind::Danger,
                                 )
                                 .h(px(26.))
@@ -1616,18 +2745,23 @@ impl VmmApp {
                                 div()
                                     .text_size(px(15.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("Snapshots"),
+                                    .child(self.t("snap.title")),
                             )
                             .child(
                                 div()
                                     .text_size(px(10.))
                                     .text_color(col(MUTED))
-                                    .child(format!("{} snapshot(s) · {}", self.snaps.len(), vm.name)),
+                                    .child(format!(
+                                        "{} snapshot(s) · {}",
+                                        self.snaps.len(),
+                                        vm.name
+                                    )),
                             ),
                     )
                     .child(
-                        button("snap_create", "Create snapshot", BtnKind::Accent)
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.snap_create(cx))),
+                        button("snap_create", self.t("snap.create"), BtnKind::Accent).on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.snap_create(cx)),
+                        ),
                     ),
             )
             .child(
@@ -1635,9 +2769,9 @@ impl VmmApp {
                     .text_size(px(10.))
                     .text_color(col(if vm.running() { AMBER } else { MUTED }))
                     .child(if vm.running() {
-                        "Stop the VM before reverting. Creating a snapshot of a running VM requires qcow2 disks."
+                        self.t("snap.warn_running")
                     } else {
-                        "Snapshots capture the disk state. Revert restores it; delete removes only the snapshot."
+                        self.t("snap.note")
                     }),
             )
             .children(rows)
@@ -1653,13 +2787,13 @@ impl VmmApp {
                         div()
                             .text_size(px(12.))
                             .font_weight(FontWeight::MEDIUM)
-                            .child("No snapshots yet"),
+                            .child(self.t("snap.empty")),
                     )
                     .child(
                         div()
                             .text_size(px(10.))
                             .text_color(col(MUTED))
-                            .child("Create one to freeze the current disk state."),
+                            .child(self.t("snap.empty_hint")),
                     )
             } else {
                 div()
@@ -1679,13 +2813,13 @@ impl VmmApp {
                 div()
                     .text_size(px(13.))
                     .font_weight(FontWeight::MEDIUM)
-                    .child("No virtual machine selected"),
+                    .child(self.t("det.no_vm")),
             )
             .child(
                 div()
                     .text_size(px(11.))
                     .text_color(col(MUTED))
-                    .child("Select a machine on the left or create a new one."),
+                    .child(self.t("det.select_vm")),
             )
     }
 
@@ -1697,7 +2831,7 @@ impl VmmApp {
             return div()
                 .text_size(px(12.))
                 .text_color(col(MUTED))
-                .child("Hardware information is unavailable for this machine.");
+                .child(self.t("hw.unavailable"));
         };
         div()
             .flex()
@@ -1712,16 +2846,13 @@ impl VmmApp {
                         div()
                             .text_size(px(15.))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .child("Hardware"),
+                            .child(self.t("tab.hardware")),
                     )
                     .child(
                         div()
                             .text_size(px(11.))
                             .text_color(col(MUTED))
-                            .child(format!(
-                                "Saved to the VM configuration. Running machines keep their current resources until the next start ({}).",
-                                vm.name
-                            )),
+                            .child(self.tf("hw.subtitle", &[("vm", vm.name.clone())])),
                     ),
             )
             .child(
@@ -1734,18 +2865,18 @@ impl VmmApp {
                     .flex()
                     .flex_col()
                     .child(self.hw_stepper(
-                        "vCPU",
+                        self.t("hw.vcpu"),
                         hw.vcpu.to_string(),
-                        &format!("1 – {} (host)", self.host_cpus),
+                        &self.tf("hw.range_vcpu", &[("max", self.host_cpus.to_string())]),
                         "hw_vcpu_minus",
                         "hw_vcpu_plus",
                         HwField::Vcpu,
                         cx,
                     ))
                     .child(self.hw_stepper(
-                        "Memory",
+                        self.t("hw.memory"),
                         fmt_mb(hw.ram),
-                        &format!("256 MiB – {} (host)", fmt_mb(self.host_ram_mb)),
+                        &self.tf("hw.range_ram", &[("max", fmt_mb(self.host_ram_mb))]),
                         "hw_ram_minus",
                         "hw_ram_plus",
                         HwField::Ram,
@@ -1753,27 +2884,43 @@ impl VmmApp {
                     ))
                     .child(
                         toggle_row(
-                            "KVM acceleration",
-                            if self.kvm_ok { "Hardware virtualization" } else { "KVM is not available on this host" },
+                            self.t("hw.kvm"),
+                            if self.kvm_ok {
+                                self.t("hw.kvm_hint")
+                            } else {
+                                self.t("hw.kvm_missing")
+                            },
                             hw.kvm,
                         )
                         .id("hw_kvm")
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.hw_toggle_kvm(cx))),
+                        .on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.hw_toggle_kvm(cx)),
+                        ),
                     )
                     .child(
-                        toggle_row("UEFI firmware", "q35 machine is selected automatically", hw.uefi)
+                        toggle_row(self.t("hw.uefi"), self.t("hw.uefi_hint"), hw.uefi)
                             .id("hw_uefi")
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.hw_toggle_uefi(cx))),
+                            .on_click(
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.hw_toggle_uefi(cx)),
+                            ),
                     )
                     .child(
-                        toggle_row("TPM 2.0", "Required by Windows 11", hw.tpm)
+                        toggle_row(self.t("hw.tpm"), self.t("hw.tpm_hint"), hw.tpm)
                             .id("hw_tpm")
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.hw_toggle_tpm(cx))),
+                            .on_click(
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.hw_toggle_tpm(cx)),
+                            ),
                     )
                     .child(
-                        toggle_row("Autostart", "Start with the libvirt daemon", hw.autostart)
-                            .id("hw_autostart")
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.hw_toggle_autostart(cx))),
+                        toggle_row(
+                            self.t("hw.autostart"),
+                            self.t("hw.autostart_hint"),
+                            hw.autostart,
+                        )
+                        .id("hw_autostart")
+                        .on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.hw_toggle_autostart(cx)),
+                        ),
                     )
                     .child(
                         div()
@@ -1790,13 +2937,13 @@ impl VmmApp {
                                         div()
                                             .text_size(px(12.))
                                             .font_weight(FontWeight::MEDIUM)
-                                            .child("Video model"),
+                                            .child(self.t("hw.video")),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(10.))
                                             .text_color(col(MUTED))
-                                            .child("qxl → virtio → vga"),
+                                            .child(self.t("hw.video_hint")),
                                     ),
                             )
                             .child(
@@ -1811,18 +2958,20 @@ impl VmmApp {
                                             .child(hw.video.clone()),
                                     )
                                     .child(
-                                        step_button("hw_video", "Change")
+                                        step_button("hw_video", self.t("hw.change"))
                                             .w(px(64.))
-                                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                this.hw_cycle_video(cx)
-                                            })),
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, _, cx| {
+                                                    this.hw_cycle_video(cx)
+                                                },
+                                            )),
                                     ),
                             ),
                     ),
             )
             .child(
                 div().w_full().flex().child(
-                    button("hw_apply", "Apply hardware changes", BtnKind::Accent)
+                    button("hw_apply", self.t("hw.apply"), BtnKind::Accent)
                         .h(px(34.))
                         .flex_1()
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.hw_apply(cx))),
@@ -1832,7 +2981,7 @@ impl VmmApp {
                 div()
                     .text_size(px(10.))
                     .text_color(col(MUTED))
-                    .child("Machine, chipset and disk devices are preserved. RAM/vCPU hot-plug depends on the guest."),
+                    .child(self.t("hw.note")),
             )
     }
 
@@ -1893,28 +3042,45 @@ impl VmmApp {
             )
     }
 
-    fn create_screen(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+    fn create_screen(&self, window: &mut Window, cx: &mut Context<Self>) -> Stateful<Div> {
         let mut iso_rows: Vec<Stateful<Div>> = Vec::new();
         iso_rows.push(self.iso_row(
             None,
-            "No installation media",
-            "Create an empty VM and install later",
+            self.t("cr.no_media"),
+            self.t("cr.no_media_hint"),
             "other",
             cx,
         ));
-        for (i, path) in self.form.isos.iter().enumerate() {
+        for path in &self.form.isos {
             let file = path
                 .file_name()
-                .map(|f| f.to_string_lossy().to_string())
+                .map(|name| name.to_string_lossy().to_string())
                 .unwrap_or_else(|| path.to_string_lossy().to_string());
             let profile = osdata::detect_from_iso(&path.to_string_lossy()).0;
             iso_rows.push(self.iso_row(
-                Some(i),
+                Some(path.clone()),
                 &file,
                 &format!("{} · ~/VirtualMachines/iso", profile.name),
                 profile.icon,
                 cx,
             ));
+        }
+        if let Some(custom) = self.form.iso.as_ref() {
+            if !self.form.isos.iter().any(|path| path == custom) {
+                let name = custom
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_else(|| custom.to_string_lossy().to_string());
+                let profile = osdata::detect_from_iso(&custom.to_string_lossy()).0;
+                let subtitle = self.tf("cr.custom_iso", &[("name", name.clone())]);
+                iso_rows.push(self.iso_row(
+                    Some(custom.clone()),
+                    &name,
+                    &subtitle,
+                    profile.icon,
+                    cx,
+                ));
+            }
         }
 
         let mut grid_rows: Vec<Div> = Vec::new();
@@ -1951,6 +3117,32 @@ impl VmmApp {
 
         let total_cpu = self.host_cpus;
         let total_ram = self.host_ram_mb;
+        let focused = self.name_focus.is_focused(window);
+        let cursor = if self.form.name.is_char_boundary(self.name_cursor) {
+            self.name_cursor
+        } else {
+            self.form.name.len()
+        };
+        let before = self.form.name[..cursor].to_string();
+        let after = self.form.name[cursor..].to_string();
+        let empty = self.form.name.is_empty();
+        let name_mode = if self.name_manual {
+            self.t("cr.name_manual")
+        } else {
+            self.t("cr.name_auto")
+        };
+        let disk_mode = if self.form.iso.is_some() {
+            self.t("cr.boot_cd")
+        } else {
+            self.t("cr.empty")
+        };
+        let disk_path = self.tf(
+            "cr.disk_path",
+            &[
+                ("name", self.form.name.clone()),
+                ("mode", disk_mode.to_string()),
+            ],
+        );
 
         div()
             .flex_1()
@@ -1980,13 +3172,13 @@ impl VmmApp {
                                         div()
                                             .text_size(px(20.))
                                             .font_weight(FontWeight::BOLD)
-                                            .child("Create a virtual machine"),
+                                            .child(self.t("cr.title")),
                                     )
                                     .child(
                                         div()
                                             .text_size(px(12.))
                                             .text_color(col(MUTED))
-                                            .child("Pick install media, confirm the detected OS and adjust hardware."),
+                                            .child(self.t("cr.subtitle")),
                                     ),
                             )
                             .child(
@@ -1994,21 +3186,36 @@ impl VmmApp {
                                     .flex()
                                     .items_center()
                                     .gap(px(8.))
+                                    .child(div().text_size(px(10.)).text_color(col(MUTED)).child(
+                                        self.tf(
+                                            "cr.host",
+                                            &[
+                                                ("cpu", total_cpu.to_string()),
+                                                ("ram", fmt_mb(total_ram)),
+                                            ],
+                                        ),
+                                    ))
                                     .child(
-                                        div()
-                                            .text_size(px(10.))
-                                            .text_color(col(MUTED))
-                                            .child(format!("host: {} CPU · {}", total_cpu, fmt_mb(total_ram))),
+                                        button(
+                                            "iso_pick",
+                                            self.t("cr.choose_iso"),
+                                            BtnKind::Normal,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                this.form_pick_iso(cx)
+                                            }),
+                                        ),
                                     )
                                     .child(
-                                        button("iso_rescan", "Rescan ISOs", BtnKind::Normal)
-                                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                this.form_rescan(cx)
-                                            })),
+                                        button("iso_rescan", self.t("cr.rescan"), BtnKind::Normal)
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, _, cx| this.form_rescan(cx),
+                                            )),
                                     ),
                             ),
                     )
-                    .child(section_label("INSTALLATION MEDIA"))
+                    .child(section_label(self.t("cr.media")))
                     .child(
                         div()
                             .id("iso_list")
@@ -2023,66 +3230,127 @@ impl VmmApp {
                         div()
                             .text_size(px(10.))
                             .text_color(col(MUTED))
-                            .child("Place .iso files in ~/VirtualMachines/iso, then press Rescan ISOs."),
+                            .child(self.t("cr.iso_hint")),
                     )
-                    .child(section_label("OPERATING SYSTEM"))
+                    .child(section_label(self.t("cr.os")))
                     .child(div().flex().flex_col().gap(px(8.)).children(grid_rows))
-                    .child(section_label("NAME"))
+                    .child(section_label(self.t("cr.name")))
                     .child(
                         div()
                             .flex()
-                            .items_center()
-                            .justify_between()
-                            .px(px(12.))
-                            .h(px(40.))
-                            .rounded(px(8.))
-                            .bg(col(CARD))
-                            .border_1()
-                            .border_color(col(BORDER))
+                            .flex_col()
+                            .gap(px(6.))
                             .child(
                                 div()
                                     .flex()
                                     .items_center()
-                                    .gap(px(10.))
+                                    .gap(px(8.))
                                     .child(
                                         div()
-                                            .text_size(px(11.))
-                                            .text_color(col(MUTED))
-                                            .child("name"),
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(10.))
+                                            .px(px(12.))
+                                            .h(px(40.))
+                                            .rounded(px(8.))
+                                            .bg(col(CARD))
+                                            .border_1()
+                                            .border_color(col(if focused {
+                                                ACCENT
+                                            } else {
+                                                BORDER
+                                            }))
+                                            .id("name_input")
+                                            .track_focus(&self.name_focus)
+                                            .cursor(CursorStyle::IBeam)
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, window, cx| {
+                                                    this.focus_name(window, cx)
+                                                },
+                                            ))
+                                            .on_key_down(cx.listener(Self::name_key_down))
+                                            .child(
+                                                div()
+                                                    .text_size(px(10.))
+                                                    .text_color(col(MUTED))
+                                                    .child(self.t("cr.name_field")),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .min_w(px(0.))
+                                                    .text_size(px(13.))
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .text_color(col(if empty {
+                                                        MUTED
+                                                    } else {
+                                                        TEXT
+                                                    }))
+                                                    .child(if empty {
+                                                        "vm".to_string()
+                                                    } else {
+                                                        before
+                                                    })
+                                                    .child(if focused {
+                                                        div().w(px(2.)).h(px(16.)).bg(col(ACCENT))
+                                                    } else {
+                                                        div()
+                                                    })
+                                                    .child(after),
+                                            )
+                                            .child(div().flex_1())
+                                            .child(
+                                                div()
+                                                    .text_size(px(9.))
+                                                    .text_color(col(if self.name_manual {
+                                                        ACCENT
+                                                    } else {
+                                                        MUTED
+                                                    }))
+                                                    .child(name_mode),
+                                            ),
                                     )
                                     .child(
-                                        div()
-                                            .text_size(px(13.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(col(TEXT))
-                                            .child(self.form.name.clone()),
+                                        button(
+                                            "name_reset",
+                                            self.t("cr.name_reset"),
+                                            BtnKind::Normal,
+                                        )
+                                        .on_click(
+                                            cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                this.form_reset_name(cx)
+                                            }),
+                                        ),
                                     ),
                             )
                             .child(
                                 div()
                                     .text_size(px(10.))
                                     .text_color(col(MUTED))
-                                    .child("auto-generated, unique"),
+                                    .child(self.t("cr.name_hint")),
                             ),
                     )
-                    .child(section_label("HARDWARE"))
+                    .child(section_label(self.t("cr.hardware")))
                     .child(
                         div()
                             .flex()
                             .gap(px(10.))
                             .child(self.create_stepper(
-                                "vCPU",
+                                self.t("hw.vcpu"),
                                 self.form.vcpu.to_string(),
-                                &format!("max {}", total_cpu),
+                                &self.tf("cr.max", &[("max", total_cpu.to_string())]),
                                 "form_vcpu_minus",
                                 "form_vcpu_plus",
                                 HwField::Vcpu,
                                 cx,
                             ))
                             .child(self.create_stepper(
-                                "Memory",
+                                self.t("hw.memory"),
                                 fmt_mb(self.form.ram),
-                                &format!("max {}", fmt_mb(total_ram)),
+                                &self.tf("cr.max", &[("max", fmt_mb(total_ram))]),
                                 "form_ram_minus",
                                 "form_ram_plus",
                                 HwField::Ram,
@@ -2103,7 +3371,7 @@ impl VmmApp {
                                         div()
                                             .text_size(px(11.))
                                             .font_weight(FontWeight::MEDIUM)
-                                            .child("Disk"),
+                                            .child(self.t("cr.disk")),
                                     )
                                     .child(
                                         div()
@@ -2123,15 +3391,19 @@ impl VmmApp {
                                                     .gap(px(6.))
                                                     .child(
                                                         step_button("form_disk_minus", "−")
-                                                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                                this.form_disk_step(-1, cx)
-                                                            })),
+                                                            .on_click(cx.listener(
+                                                                |this, _: &ClickEvent, _, cx| {
+                                                                    this.form_disk_step(-1, cx)
+                                                                },
+                                                            )),
                                                     )
                                                     .child(
                                                         step_button("form_disk_plus", "＋")
-                                                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                                                this.form_disk_step(1, cx)
-                                                            })),
+                                                            .on_click(cx.listener(
+                                                                |this, _: &ClickEvent, _, cx| {
+                                                                    this.form_disk_step(1, cx)
+                                                                },
+                                                            )),
                                                     ),
                                             ),
                                     )
@@ -2139,31 +3411,33 @@ impl VmmApp {
                                         div()
                                             .text_size(px(10.))
                                             .text_color(col(MUTED))
-                                            .child("qcow2, grows on demand"),
+                                            .child(self.t("cr.disk_hint")),
                                     ),
                             ),
                     )
                     .child(
                         toggle_row(
-                            "KVM acceleration",
-                            if self.kvm_ok { "Recommended when /dev/kvm is available" } else { "KVM is not available on this host" },
+                            self.t("cr.kvm"),
+                            if self.kvm_ok {
+                                self.t("cr.kvm_hint")
+                            } else {
+                                self.t("hw.kvm_missing")
+                            },
                             self.form.kvm,
                         )
                         .id("form_kvm")
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.form.kvm = !this.form.kvm && this.kvm_ok;
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(
+                            |this, _: &ClickEvent, _, cx| {
+                                this.form.kvm = !this.form.kvm && this.kvm_ok;
+                                cx.notify();
+                            },
+                        )),
                     )
                     .child(
                         div()
                             .text_size(px(10.))
                             .text_color(col(MUTED))
-                            .child(format!(
-                                "Disk: ~/VirtualMachines/vms/{}/disk.qcow2 · {}",
-                                self.form.name,
-                                if self.form.iso.is_some() { "boot from CD-ROM" } else { "empty VM" }
-                            )),
+                            .child(disk_path),
                     )
                     .child(
                         div()
@@ -2173,13 +3447,13 @@ impl VmmApp {
                             .gap(px(8.))
                             .pt(px(2.))
                             .child(
-                                button("create_cancel", "Cancel", BtnKind::Normal)
+                                button("create_cancel", self.t("cr.cancel"), BtnKind::Normal)
                                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                         this.nav(Screen::Vms, cx)
                                     })),
                             )
                             .child(
-                                button("create_go", "Create virtual machine", BtnKind::Accent)
+                                button("create_go", self.t("cr.create"), BtnKind::Accent)
                                     .h(px(34.))
                                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                         this.create_vm(cx)
@@ -2191,17 +3465,20 @@ impl VmmApp {
 
     fn iso_row(
         &self,
-        idx: Option<usize>,
+        path: Option<PathBuf>,
         title: &str,
         subtitle: &str,
         icon: &str,
         cx: &mut Context<Self>,
     ) -> Stateful<Div> {
-        let selected = self.form.iso == idx;
+        let selected = self.form.iso.as_ref() == path.as_ref();
+        let click_path = path.clone();
         div()
             .id(SharedString::from(format!(
                 "iso-{}",
-                idx.map(|i| i.to_string()).unwrap_or_else(|| "none".into())
+                path.as_ref()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "none".into())
             )))
             .flex()
             .items_center()
@@ -2214,7 +3491,9 @@ impl VmmApp {
             .border_color(col(if selected { ACCENT } else { BORDER }))
             .cursor_pointer()
             .hover(|this| this.border_color(col(ACCENT_D)))
-            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.form_select_iso(idx, cx)))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.form_select_iso(click_path.clone(), cx)
+            }))
             .child(os_icon(icon, 22.0))
             .child(
                 div()
@@ -2345,21 +3624,87 @@ impl VmmApp {
                             .child(title),
                     )
                     .child(div().text_size(px(12.)).text_color(col(MUTED)).child(body))
-                    .child(
-                        div().pt(px(6.)).child(
-                            button(
-                                "placeholder_back",
-                                "Back to virtual machines",
-                                BtnKind::Accent,
-                            )
-                            .on_click(
-                                cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.nav(Screen::Vms, cx)
-                                }),
-                            ),
+                    .child(div().pt(px(6.)).child(
+                        button("placeholder_back", self.t("ph.back"), BtnKind::Accent).on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.nav(Screen::Vms, cx)),
                         ),
+                    )),
+            )
+    }
+
+    fn confirm_overlay(&self, dialog: &ConfirmDialog, cx: &mut Context<Self>) -> Div {
+        div()
+            .absolute()
+            .top(px(0.))
+            .left(px(0.))
+            .right(px(0.))
+            .bottom(px(0.))
+            .bg(alpha(col(0x000000), 0.62))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(470.))
+                    .p(px(24.))
+                    .rounded(px(12.))
+                    .bg(col(PANEL))
+                    .border_1()
+                    .border_color(col(BORDER))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.))
+                    .child(div().text_size(px(26.)).text_color(col(AMBER)).child("⚠"))
+                    .child(
+                        div()
+                            .text_size(px(17.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(dialog.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(col(MUTED))
+                            .child(dialog.body.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap(px(8.))
+                            .pt(px(4.))
+                            .child(
+                                button("confirm_cancel", self.t("cr.cancel"), BtnKind::Normal)
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.confirm = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                button("confirm_yes", &dialog.confirm, BtnKind::Danger).on_click(
+                                    cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.resolve_confirm(cx)
+                                    }),
+                                ),
+                            ),
                     ),
             )
+    }
+
+    fn resolve_confirm(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.confirm.take() else {
+            return;
+        };
+        if dialog.opened_at.elapsed() < Duration::from_millis(500) {
+            self.confirm = Some(dialog);
+            return;
+        }
+        match dialog.action {
+            ConfirmAction::DeleteVm(name) => self.delete_selected_now(&name, cx),
+            ConfirmAction::RemoveDisk(target) => self.disk_remove_now(&target, cx),
+            ConfirmAction::RemoveNic(mac) => self.nic_remove_now(&mac, cx),
+        }
     }
 
     fn status_bar(&self, cx: &mut Context<Self>) -> Stateful<Div> {
@@ -2372,7 +3717,7 @@ impl VmmApp {
                     StatusKind::Error => col(RED),
                 },
             ),
-            None => ("Ready".to_string(), col(MUTED)),
+            None => (self.t("status.ready").to_string(), col(MUTED)),
         };
         div()
             .id("status_bar")
@@ -2392,7 +3737,7 @@ impl VmmApp {
                 div()
                     .text_size(px(10.))
                     .text_color(col(MUTED))
-                    .child("GPL-3.0 · Rust port"),
+                    .child("GPL-3.0 · Rust"),
             )
     }
 }
@@ -2403,6 +3748,12 @@ impl Render for VmmApp {
             self.started = true;
             window.set_window_title("VMM-KVM");
             self.start_tick(cx);
+        }
+        if self.name_focus_pending && self.screen == Screen::Create {
+            self.name_focus_pending = false;
+            window.focus(&self.name_focus);
+            self.name_cursor = self.form.name.len();
+            self.name_fresh = !self.name_manual;
         }
         div()
             .flex()
@@ -2421,8 +3772,13 @@ impl Render for VmmApp {
                     .flex()
                     .flex_col()
                     .child(self.toolbar(cx))
-                    .child(self.body(cx))
+                    .child(self.body(window, cx))
                     .child(self.status_bar(cx)),
+            )
+            .children(
+                self.confirm
+                    .clone()
+                    .map(|dialog| self.confirm_overlay(&dialog, cx)),
             )
     }
 }
@@ -2555,14 +3911,39 @@ fn toggle_pill(on: bool) -> Div {
     }
 }
 
-fn state_name(vm: &Vm) -> &'static str {
+impl VmmApp {
+    fn state_name(&self, vm: &Vm) -> &'static str {
+        self.t(state_key(vm))
+    }
+
+    fn state_badge(&self, vm: &Vm) -> Div {
+        let color = state_color(vm);
+        div()
+            .flex()
+            .items_center()
+            .gap(px(5.))
+            .px(px(7.))
+            .py(px(2.))
+            .rounded(px(9.))
+            .bg(alpha(color, 0.12))
+            .child(dot(color, 5.0))
+            .child(
+                div()
+                    .text_size(px(9.))
+                    .text_color(color)
+                    .child(self.state_name(vm)),
+            )
+    }
+}
+
+fn state_key(vm: &Vm) -> &'static str {
     match vm.state {
-        1 => "Running",
-        3 => "Paused",
-        4 => "Shutting down",
-        6 => "Crashed",
-        7 => "Suspended",
-        _ => "Shut off",
+        1 => "state.running",
+        3 => "state.paused",
+        4 => "state.shutdown",
+        6 => "state.crashed",
+        7 => "state.suspended",
+        _ => "state.shutoff",
     }
 }
 
@@ -2573,25 +3954,6 @@ fn state_color(vm: &Vm) -> Rgba {
         6 => col(RED),
         _ => col(MUTED),
     }
-}
-
-fn state_badge(vm: &Vm) -> Div {
-    let color = state_color(vm);
-    div()
-        .flex()
-        .items_center()
-        .gap(px(5.))
-        .px(px(7.))
-        .py(px(2.))
-        .rounded(px(9.))
-        .bg(alpha(color, 0.12))
-        .child(dot(color, 5.0))
-        .child(
-            div()
-                .text_size(px(9.))
-                .text_color(color)
-                .child(state_name(vm)),
-        )
 }
 
 fn spark(history: Option<&VecDeque<f32>>, color: Rgba) -> Div {
@@ -2651,4 +4013,26 @@ fn fmt_time(created: &str) -> String {
         year += 1;
     }
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
+}
+
+fn prev_boundary(text: &str, index: usize) -> usize {
+    if index == 0 {
+        return 0;
+    }
+    let mut position = index - 1;
+    while position > 0 && !text.is_char_boundary(position) {
+        position -= 1;
+    }
+    position
+}
+
+fn next_boundary(text: &str, index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    let mut position = index + 1;
+    while position < text.len() && !text.is_char_boundary(position) {
+        position += 1;
+    }
+    position
 }

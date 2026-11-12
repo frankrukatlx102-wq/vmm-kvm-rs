@@ -6,5 +6,6 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 gpui = "0.2.2"
+rfd = "0.18.0"
 virt = "0.5.0"
 xmltree = "0.12.0"
