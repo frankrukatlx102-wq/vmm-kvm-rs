@@ -240,14 +240,7 @@ impl VmmApp {
             nic_model: 0,
             snaps: Vec::new(),
             snap_arm: None,
-            confirm: Some(ConfirmDialog {
-                title: "Удалить vmmself-demo?".into(),
-                body: "Определение ВМ и NVRAM будут удалены. Файлы дисков останутся на диске."
-                    .into(),
-                confirm: "Удалить".into(),
-                action: ConfirmAction::DeleteVm("vmmself-demo".into()),
-                opened_at: Instant::now(),
-            }),
+            confirm: None,
             stats: HashMap::new(),
             form,
             host_ram_mb,
