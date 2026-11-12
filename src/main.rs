@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 mod backend;
 mod hostinfo;
 mod i18n;

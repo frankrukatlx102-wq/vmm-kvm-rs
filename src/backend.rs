@@ -33,7 +33,6 @@ pub struct DiskInfo {
     pub bus: String,
     pub device: String,
     pub file: String,
-    pub driver: String,
     pub size_gb: u32,
 }
 
@@ -60,7 +59,6 @@ pub struct Vm {
     pub maxmem_mb: u32,
     pub live_vcpus: u32,
     pub live_maxmem_mb: u32,
-    pub mem_mb: u32,
     pub disk_gb: u32,
     pub os_id: String,
     pub autostart: bool,
@@ -72,9 +70,6 @@ impl Vm {
     }
     pub fn paused(&self) -> bool {
         self.state == 3
-    }
-    pub fn stopped(&self) -> bool {
-        matches!(self.state, 4 | 5 | 6)
     }
     pub fn os(&self) -> &'static OsProfile {
         osdata::find(&self.os_id)
@@ -440,10 +435,6 @@ impl Backend {
         })
     }
 
-    pub fn uri(&self) -> &str {
-        &self.uri
-    }
-
     pub fn is_session(&self) -> bool {
         self.uri.contains("session")
     }
@@ -522,7 +513,6 @@ impl Backend {
             maxmem_mb,
             live_vcpus: info.nr_virt_cpu,
             live_maxmem_mb: (info.max_mem / 1024) as u32,
-            mem_mb: (info.memory / 1024) as u32,
             disk_gb: disk_size,
             os_id,
             autostart: dom.autostart().unwrap_or(false),
@@ -549,11 +539,6 @@ impl Backend {
         Ok(())
     }
 
-    pub fn reset(&self, name: &str) -> Result<()> {
-        self.find(name)?.reset()?;
-        Ok(())
-    }
-
     pub fn pause(&self, name: &str) -> Result<()> {
         self.find(name)?.suspend()?;
         Ok(())
@@ -561,11 +546,6 @@ impl Backend {
 
     pub fn resume(&self, name: &str) -> Result<()> {
         self.find(name)?.resume()?;
-        Ok(())
-    }
-
-    pub fn set_autostart(&self, name: &str, on: bool) -> Result<()> {
-        self.find(name)?.set_autostart(on)?;
         Ok(())
     }
 
@@ -970,7 +950,6 @@ impl Backend {
             }
             let target = child(disk, "target");
             let source = child(disk, "source");
-            let driver = child(disk, "driver");
             let file = source
                 .and_then(|el| el.attributes.get("file").cloned())
                 .unwrap_or_default();
@@ -993,9 +972,6 @@ impl Backend {
                     .unwrap_or_default(),
                 device,
                 file,
-                driver: driver
-                    .and_then(|el| el.attributes.get("type").cloned())
-                    .unwrap_or_default(),
                 size_gb,
             });
         }

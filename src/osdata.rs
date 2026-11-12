@@ -1,16 +1,7 @@
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Family {
-    Windows,
-    Linux,
-    Bsd,
-    Other,
-}
-
 pub struct OsProfile {
     pub id: &'static str,
     pub name: &'static str,
     pub icon: &'static str,
-    pub family: Family,
     pub vcpu: u32,
     pub ram_mb: u32,
     pub disk_gb: u32,
@@ -23,13 +14,12 @@ pub struct OsProfile {
 }
 
 macro_rules! os {
-    ($id:expr, $name:expr, $icon:expr, $fam:ident, $vcpu:expr, $ram:expr, $disk:expr,
+    ($id:expr, $name:expr, $icon:expr, $vcpu:expr, $ram:expr, $disk:expr,
      $uefi:expr, $tpm:expr, $machine:expr, $bus:expr, $net:expr, $video:expr) => {
         OsProfile {
             id: $id,
             name: $name,
             icon: $icon,
-            family: Family::$fam,
             vcpu: $vcpu,
             ram_mb: $ram,
             disk_gb: $disk,
@@ -46,7 +36,7 @@ macro_rules! os {
 macro_rules! linux {
     ($id:expr, $name:expr, $icon:expr, $vcpu:expr, $ram:expr, $disk:expr, $uefi:expr) => {
         os!(
-            $id, $name, $icon, Linux, $vcpu, $ram, $disk, $uefi, false, "q35", "virtio", "virtio",
+            $id, $name, $icon, $vcpu, $ram, $disk, $uefi, false, "q35", "virtio", "virtio",
             "virtio"
         )
     };
@@ -57,7 +47,6 @@ pub const OS_LIST: &[OsProfile] = &[
         "windows-11",
         "Windows 11",
         "windows-11",
-        Windows,
         4,
         4096,
         64,
@@ -72,7 +61,6 @@ pub const OS_LIST: &[OsProfile] = &[
         "windows-10",
         "Windows 10",
         "windows-10",
-        Windows,
         4,
         4096,
         64,
@@ -87,7 +75,6 @@ pub const OS_LIST: &[OsProfile] = &[
         "windows-8",
         "Windows 8",
         "windows-8",
-        Windows,
         2,
         2048,
         40,
@@ -102,7 +89,6 @@ pub const OS_LIST: &[OsProfile] = &[
         "windows-8.1",
         "Windows 8.1",
         "windows-8",
-        Windows,
         2,
         2048,
         40,
@@ -117,7 +103,6 @@ pub const OS_LIST: &[OsProfile] = &[
         "windows-7",
         "Windows 7",
         "windows-7",
-        Windows,
         2,
         2048,
         40,
@@ -132,7 +117,6 @@ pub const OS_LIST: &[OsProfile] = &[
         "windows-vista",
         "Windows Vista",
         "windows-vista",
-        Windows,
         2,
         2048,
         40,
@@ -147,7 +131,6 @@ pub const OS_LIST: &[OsProfile] = &[
         "windows-xp",
         "Windows XP",
         "windows-xp",
-        Windows,
         1,
         1024,
         20,
@@ -162,7 +145,6 @@ pub const OS_LIST: &[OsProfile] = &[
         "windows-2000",
         "Windows 2000",
         "windows-flag",
-        Windows,
         1,
         512,
         16,
@@ -177,7 +159,6 @@ pub const OS_LIST: &[OsProfile] = &[
         "windows-me",
         "Windows ME",
         "windows-flag",
-        Windows,
         1,
         256,
         10,
@@ -192,7 +173,6 @@ pub const OS_LIST: &[OsProfile] = &[
         "windows-98",
         "Windows 98",
         "windows-98",
-        Windows,
         1,
         256,
         10,
@@ -207,7 +187,6 @@ pub const OS_LIST: &[OsProfile] = &[
         "windows-95",
         "Windows 95",
         "windows-95",
-        Windows,
         1,
         128,
         8,
@@ -222,7 +201,6 @@ pub const OS_LIST: &[OsProfile] = &[
         "windows-nt",
         "Windows NT",
         "windows-nt",
-        Windows,
         1,
         128,
         8,
@@ -264,22 +242,18 @@ pub const OS_LIST: &[OsProfile] = &[
     linux!("garuda", "Garuda Linux", "garudalinux", 2, 4096, 40, true),
     linux!("linux", "Linux (generic)", "linux", 2, 2048, 20, true),
     os!(
-        "freebsd", "FreeBSD", "freebsd", Bsd, 2, 2048, 20, true, false, "q35", "virtio", "virtio",
-        "vga"
+        "freebsd", "FreeBSD", "freebsd", 2, 2048, 20, true, false, "q35", "virtio", "virtio", "vga"
     ),
     os!(
-        "openbsd", "OpenBSD", "openbsd", Bsd, 2, 2048, 20, false, false, "pc", "virtio", "virtio",
-        "vga"
+        "openbsd", "OpenBSD", "openbsd", 2, 2048, 20, false, false, "pc", "virtio", "virtio", "vga"
     ),
     os!(
-        "netbsd", "NetBSD", "netbsd", Bsd, 2, 2048, 20, false, false, "pc", "virtio", "virtio",
-        "vga"
+        "netbsd", "NetBSD", "netbsd", 2, 2048, 20, false, false, "pc", "virtio", "virtio", "vga"
     ),
     os!(
         "android",
         "Android x86",
         "android",
-        Other,
         2,
         2048,
         8,
@@ -291,8 +265,7 @@ pub const OS_LIST: &[OsProfile] = &[
         "vga"
     ),
     os!(
-        "other", "Other", "other", Other, 2, 2048, 20, false, false, "pc", "virtio", "virtio",
-        "virtio"
+        "other", "Other", "other", 2, 2048, 20, false, false, "pc", "virtio", "virtio", "virtio"
     ),
 ];
 
