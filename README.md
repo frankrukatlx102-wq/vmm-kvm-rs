@@ -6,7 +6,7 @@
 [![gpui](https://img.shields.io/badge/UI-gpui-2dd4bf)](https://github.com/zed-industries/zed/tree/main/crates/gpui)
 [![libvirt](https://img.shields.io/badge/backend-libvirt-blue)](https://libvirt.org/)
 [![Linux](https://img.shields.io/badge/platform-Linux-lightgrey?logo=linux)](https://kernel.org/)
-[![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
+[![License](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
 
 ![VMM-KVM main window](docs/screenshots/01-main.png)
 
@@ -505,10 +505,10 @@ For bug reports include:
 
 Copyright (C) 2026 VMM-KVM contributors.
 
-This program is free software: you can redistribute it and/or modify it under the terms of the **GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version**.
+This program is free software: you can redistribute it and/or modify it under the terms of the **GNU General Public License version 3** as published by the Free Software Foundation.
 
 This program is distributed in the hope that it will be useful, but **without any warranty**; without even the implied warranty of merchantability or fitness for a particular purpose. See the GNU General Public License for more details.
 
 You should have received a copy of the GNU General Public License along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-The full license text is in [LICENSE](LICENSE). SPDX identifier: `GPL-3.0-or-later`.
+The full license text is in [LICENSE](LICENSE). SPDX identifier: `GPL-3.0-only`.
