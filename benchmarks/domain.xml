@@ -1,0 +1,58 @@
+<domain type='kvm'>
+  <name>bench-vm</name>
+  <uuid>2f1c7e3a-9a55-4f7e-bb2e-6a0a4e51c0d8</uuid>
+  <description>VMM-KVM:os=ubuntu|24.04</description>
+  <memory unit='MiB'>8192</memory>
+  <currentMemory unit='MiB'>8192</currentMemory>
+  <vcpu placement='static'>6</vcpu>
+  <os firmware='efi'>
+    <type arch='x86_64' machine='pc-q35-9.2'>hvm</type>
+    <boot dev='hd'/>
+  </os>
+  <features>
+    <acpi/>
+    <apic/>
+    <smm state='on'/>
+  </features>
+  <cpu mode='host-model' check='partial'/>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/var/lib/libvirt/images/bench-vm/disk.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/var/lib/libvirt/images/bench-vm/data.qcow2'/>
+      <target dev='vdb' bus='virtio'/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <source file='/var/lib/libvirt/images/bench.iso'/>
+      <target dev='sdb' bus='sata'/>
+      <readonly/>
+    </disk>
+    <controller type='sata' index='0'/>
+    <interface type='user'>
+      <mac address='52:54:00:6a:1c:2e'/>
+      <model type='virtio'/>
+    </interface>
+    <console type='pty'>
+      <target type='serial' port='0'/>
+    </console>
+    <channel type='unix'>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+    <input type='tablet' bus='usb'/>
+    <graphics type='spice' autoport='yes' listen='127.0.0.1'>
+      <listen type='address' address='127.0.0.1'/>
+    </graphics>
+    <sound model='ich6'/>
+    <video>
+      <model type='virtio' heads='1' vram='16384'/>
+    </video>
+    <tpm model='tpm-crb'>
+      <backend type='emulator' version='2.0' persistent_state='yes'/>
+    </tpm>
+    <memballoon model='virtio'/>
+  </devices>
+</domain>

@@ -14,6 +14,20 @@ VMM-KVM gives you the everyday QEMU/KVM workflow in one window: see your machine
 
 The screenshots in this README were captured with demo data. No real VM names, home directories or personal files are shown.
 
+## Performance at a glance
+
+**The Rust version is faster than the Python/PySide6 version in startup and CPU-bound work.** Measured on the same machine, same libvirt session, same Wayland desktop:
+
+| Benchmark | Python + PySide6 | Rust + gpui | Result |
+|---|---:|---:|---|
+| Startup until the window is mapped | 889 ms | 259 ms | **3.4× faster** |
+| ISO detection + automatic VM name | 22.9 µs/op | 1.43 µs/op | **16× faster** |
+| Raw domain XML parse | 77.2 µs/op | 94.0 µs/op | Python 1.2× faster |
+| Idle memory after 8 s (RSS / PSS) | 115 / 74 MB | 160 / 140 MB | Python lower |
+| Distribution footprint | ~53 MB | ~26 MB | **2× smaller** |
+
+The Rust window appears three times sooner and performs the per-keystroke ISO/OS detection work roughly sixteen times faster. The trade-offs are honest: PySide6 currently has a smaller RAM footprint in this build, and Python's C-accelerated `ElementTree` is slightly faster than `xmltree` at raw XML parsing. Full methodology and raw runs are in [Benchmarks](#benchmarks).
+
 ## Why this project exists
 
 Most Linux VM managers are either tied to a heavy desktop stack, built around a remote management platform, or require you to remember a pile of `virsh` and `qemu-img` commands for simple tasks. VMM-KVM is a deliberately small desktop application:
@@ -422,9 +436,73 @@ Development checks:
 cargo fmt --check
 cargo clippy
 cargo build --release
+cargo run --release -- --bench
 ```
 
 The project has no unit-test suite for gpui rendering; UI verification is done manually on a real Wayland/X11 session.
+
+## Benchmarks
+
+All numbers below were measured on a single machine — no virtual machines were created, started, stopped or downloaded for these tests:
+
+| Component | Value |
+|---|---|
+| CPU | Intel Core i5-9300H, 4 cores / 8 threads |
+| Memory | 15.5 GiB |
+| OS | CachyOS Linux, kernel 7.3.1 |
+| Session | Wayland, niri |
+| Python | 3.14.9 |
+| PySide6 | 6.12.0 |
+| Rust | 1.99.1 |
+| libvirt | 12.9.0 |
+| QEMU | 11.1.3 |
+
+### Startup and memory
+
+Startup is the median of seven launches for each version. A launch is considered complete when niri reports a new window owned by the application process. Memory is read from `/proc/<pid>/smaps_rollup` after eight seconds of idle time, median of three runs. The Python window was launched with `python3 -m vmm_kvm`; the Rust window with the release binary.
+
+| Run | Python startup | Rust startup |
+|---|---:|---:|
+| Median | 888.9 ms | 259.1 ms |
+| Range | 857.1–902.7 ms | 256.3–307.5 ms |
+
+| Metric | Python | Rust |
+|---|---:|---:|
+| RSS | 114.9 MB | 160.5 MB |
+| PSS | 73.7 MB | 140.2 MB |
+
+The Rust binary is `26 MB`; the assets add `267 KB`. The Python application sources are `815 KB`, but the PySide6 runtime is `52 MB` on this machine, for a total of roughly `53 MB`.
+
+### ISO detection and XML parsing
+
+The CPU benchmarks are medians of three runs. ISO detection includes filename matching, OS profile selection, version extraction and automatic name generation. The XML benchmark parses the same 57-line q35 domain definition with a disk, CD-ROM, network, TPM and graphics device.
+
+| Operation | Python | Rust | Speedup |
+|---|---:|---:|---:|
+| ISO detection + auto-name | 22.9 µs/op | 1.43 µs/op | **16×** |
+| Domain XML parse | 77.2 µs/op | 94.0 µs/op | 0.82× (Python faster) |
+
+Reproduce the Rust side:
+
+```bash
+cargo run --release -- --bench
+```
+
+The Rust benchmark parses `benchmarks/domain.xml` and times 2,000,000 ISO operations plus 100,000 XML parses. Reproduce the Python side from a checkout of the [Python version](https://github.com/frankrukatlx102-wq/vmm-kvm):
+
+```bash
+python3 benchmarks/python_cpu.py /path/to/vmm-kvm
+```
+
+The Python script uses the real `_detect` and `_auto_name` functions from the PySide6 create dialog and the same ten ISO filenames.
+
+### Notes
+
+- Benchmarks were run while the desktop was otherwise in use; medians reduce scheduling noise, but absolute numbers vary by machine and load.
+- Startup measures process launch to first mapped window, not a full libvirt refresh or first painted frame. Both applications connect to libvirt during startup.
+- Memory includes the GPU/rendering stack of each toolkit. gpui's Vulkan renderer is heavier in RAM in this build.
+- Raw XML parsing is not the dominant cost of the UI refresh; libvirt calls and domain XML round-trips matter more. The Rust version still wins on startup and the ISO workflow.
+- No ISO images or operating systems were downloaded for these benchmarks.
 
 ## Project structure
 
@@ -439,6 +517,9 @@ src/
 assets/
   icons/os/     36 OS SVG icons
   icons/vmm-kvm.svg, vmm-kvm.png, vmm-kvm-256.png
+benchmarks/
+  domain.xml        representative q35 domain used by --bench
+  python_cpu.py     Python comparison benchmark
 docs/screenshots/
   README screenshots captured with demo data
 ```

@@ -59,6 +59,9 @@ fn main() {
     if args.iter().any(|arg| arg == "--selftest") {
         std::process::exit(run_selftest());
     }
+    if args.iter().any(|arg| arg == "--bench") {
+        std::process::exit(run_bench());
+    }
     Application::new()
         .with_assets(Assets {
             base: assets_base(),
@@ -290,4 +293,63 @@ fn cleanup_selftest(b: &backend::Backend, name: &str) {
         .join("vms")
         .join(name);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+fn run_bench() -> i32 {
+    use std::hint::black_box;
+    use std::io::Cursor;
+    use std::time::Instant;
+
+    let files = [
+        "ubuntu-24.04-desktop-amd64.iso",
+        "debian-13.7.0-amd64-netinst.iso",
+        "Fedora-Workstation-Live-42.iso",
+        "archlinux-2026.11.01-x86_64.iso",
+        "openSUSE-Leap-16.0-DVD-x86_64.iso",
+        "Windows-11_24H2_x64.iso",
+        "windows-10-22H2-amd64.iso",
+        "FreeBSD-15.0-RELEASE-amd64-dvd1.iso",
+        "linuxmint-23-cinnamon-64bit.iso",
+        "rocky-10.0-x86_64-dvd.iso",
+    ];
+    for _ in 0..1000 {
+        for file in files {
+            let (profile, version) = osdata::detect_from_iso(file);
+            black_box(osdata::auto_name(profile, &version));
+        }
+    }
+    let iso_iterations = 200_000u64;
+    let iso_start = Instant::now();
+    for _ in 0..iso_iterations {
+        for file in files {
+            let (profile, version) = osdata::detect_from_iso(file);
+            black_box(osdata::auto_name(profile, &version));
+        }
+    }
+    let iso_ops = iso_iterations * files.len() as u64;
+    let iso_ns = iso_start.elapsed().as_nanos() as f64 / iso_ops as f64;
+
+    let xml = include_str!("../benchmarks/domain.xml");
+    for _ in 0..100 {
+        let parsed = xmltree::Element::parse(Cursor::new(xml.as_bytes())).is_ok();
+        black_box(parsed);
+    }
+    let xml_iterations = 100_000u64;
+    let xml_start = Instant::now();
+    for _ in 0..xml_iterations {
+        let parsed = xmltree::Element::parse(Cursor::new(xml.as_bytes()));
+        black_box(parsed.is_ok());
+    }
+    let xml_ns = xml_start.elapsed().as_nanos() as f64 / xml_iterations as f64;
+
+    println!(
+        "iso_ops={iso_ops} iso_ms={:.3} iso_ns_per_op={iso_ns:.1}",
+        iso_start.elapsed().as_secs_f64() * 1000.0
+    );
+    println!(
+        "xml_ops={xml_iterations} xml_ms={:.3} xml_ns_per_op={xml_ns:.1}",
+        xml_start.elapsed().as_secs_f64() * 1000.0
+    );
+    let _ = &xml;
+    0
 }
