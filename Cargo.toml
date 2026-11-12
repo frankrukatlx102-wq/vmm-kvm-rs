@@ -2,6 +2,12 @@
 name = "vmm-kvm-rs"
 version = "0.1.0"
 edition = "2024"
+description = "Native Linux QEMU/KVM manager with a gpui interface and libvirt backend"
+repository = "https://github.com/frankrukatlx102-wq/vmm-kvm-rs"
+license = "GPL-3.0-or-later"
+readme = "README.md"
+keywords = ["qemu", "kvm", "libvirt", "virtualization", "gpui"]
+categories = ["system-tools", "emulators"]
 
 [dependencies]
 anyhow = "1.0.104"

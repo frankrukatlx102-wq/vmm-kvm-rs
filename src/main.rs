@@ -42,6 +42,15 @@ fn assets_base() -> PathBuf {
             }
         }
     }
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));
+    if let Some(data_home) = data_home {
+        let dir = data_home.join("vmm-kvm/assets");
+        if dir.is_dir() {
+            return dir;
+        }
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets")
 }
 
