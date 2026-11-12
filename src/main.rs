@@ -227,17 +227,41 @@ fn run_selftest() -> i32 {
     })();
     cleanup_selftest(&b, &uefi_name);
 
-    match (ok, uefi_ok) {
-        (Ok(()), Ok(())) => {
+    let iso_name = format!("vmmself-rs-iso-{}", std::process::id());
+    cleanup_selftest(&b, &iso_name);
+    let iso_file = std::env::temp_dir().join("vmmself-rs-create.iso");
+    let iso_ok = (|| -> Result<(), String> {
+        std::fs::write(&iso_file, b"").map_err(|e| e.to_string())?;
+        let profile = osdata::find("debian");
+        b.create_vm(
+            &iso_name,
+            profile,
+            2,
+            2048,
+            10,
+            &iso_file.to_string_lossy(),
+            true,
+        )
+        .map_err(|e| e.to_string())?;
+        let disks = b.disks(&iso_name).map_err(|e| e.to_string())?;
+        if !disks
+            .iter()
+            .any(|disk| disk.device == "cdrom" && disk.file == iso_file.to_string_lossy())
+        {
+            return Err("created VM has no ISO media".to_string());
+        }
+        println!("ok: create with installation ISO");
+        Ok(())
+    })();
+    cleanup_selftest(&b, &iso_name);
+    let _ = std::fs::remove_file(&iso_file);
+
+    match (ok, uefi_ok, iso_ok) {
+        (Ok(()), Ok(()), Ok(())) => {
             println!("SELFTEST PASS");
             0
         }
-        (Err(e), _) => {
-            println!("FAIL: {e}");
-            println!("SELFTEST FAIL");
-            1
-        }
-        (_, Err(e)) => {
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
             println!("FAIL: {e}");
             println!("SELFTEST FAIL");
             1
