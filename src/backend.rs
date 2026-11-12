@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use virt::connect::Connect;
 use virt::domain::{Domain, DomainState};
 use virt::sys;
@@ -28,6 +28,13 @@ pub struct Hw {
 }
 
 #[derive(Clone)]
+pub struct SnapInfo {
+    pub name: String,
+    pub desc: String,
+    pub created: String,
+}
+
+#[derive(Clone)]
 pub struct Vm {
     pub name: String,
     pub state: u8,
@@ -36,6 +43,7 @@ pub struct Vm {
     pub live_vcpus: u32,
     pub live_maxmem_mb: u32,
     pub mem_mb: u32,
+    pub disk_gb: u32,
     pub os_id: String,
     pub autostart: bool,
 }
@@ -76,7 +84,8 @@ fn child_mut<'a>(el: &'a mut Element, name: &str) -> Option<&'a mut Element> {
 }
 
 fn remove_children(el: &mut Element, name: &str) {
-    el.children.retain(|n| !matches!(n, XMLNode::Element(e) if e.name == name));
+    el.children
+        .retain(|n| !matches!(n, XMLNode::Element(e) if e.name == name));
 }
 
 fn el_text(el: &Element) -> String {
@@ -107,8 +116,15 @@ fn xml_string(el: &Element) -> Result<String> {
 fn mem_mib(el: Option<&Element>) -> u32 {
     let Some(el) = el else { return 0 };
     let text = el_text(el);
-    let Ok(val) = text.trim().parse::<u64>() else { return 0 };
-    match el.attributes.get("unit").map(|s| s.as_str()).unwrap_or("KiB") {
+    let Ok(val) = text.trim().parse::<u64>() else {
+        return 0;
+    };
+    match el
+        .attributes
+        .get("unit")
+        .map(|s| s.as_str())
+        .unwrap_or("KiB")
+    {
         "KiB" | "K" | "k" => (val / 1024) as u32,
         "MiB" | "M" | "m" => val as u32,
         "GiB" | "G" | "g" => (val * 1024) as u32,
@@ -126,14 +142,169 @@ fn esc(s: &str) -> String {
 
 fn safe_dir(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
+}
+
+fn qcow2_gb(path: &str) -> Option<u32> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).ok()?;
+    if &magic != b"QFI\xfb" {
+        let len = file.metadata().ok()?.len();
+        return Some((len.div_ceil(1 << 30)).max(1) as u32);
+    }
+    file.seek(SeekFrom::Start(24)).ok()?;
+    let mut buf = [0u8; 8];
+    file.read_exact(&mut buf).ok()?;
+    let size = u64::from_be_bytes(buf);
+    Some((size.div_ceil(1 << 30)).max(1) as u32)
+}
+
+fn disk_gb(root: &Element) -> u32 {
+    let Some(devices) = child(root, "devices") else {
+        return 0;
+    };
+    for node in &devices.children {
+        let XMLNode::Element(disk) = node else {
+            continue;
+        };
+        if disk.name != "disk" {
+            continue;
+        }
+        if disk
+            .attributes
+            .get("device")
+            .map(|d| d != "disk")
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if let Some(src) = child(disk, "source") {
+            if let Some(file) = src.attributes.get("file") {
+                if let Some(gb) = qcow2_gb(file) {
+                    return gb;
+                }
+            }
+        }
+    }
+    0
+}
+
+fn find_ovmf() -> Option<(String, Option<PathBuf>)> {
+    const DIRS: &[&str] = &[
+        "/usr/share/OVMF",
+        "/usr/share/OVMF/x64",
+        "/usr/share/OVMF/x64/OVMF",
+        "/usr/share/ovmf",
+        "/usr/share/ovmf/x64",
+        "/usr/share/edk2-ovmf",
+        "/usr/share/edk2-ovmf/x64",
+        "/usr/share/edk2/ovmf",
+        "/usr/share/edk2/x64",
+        "/usr/share/qemu",
+        "/usr/share/qemu/ovmf",
+    ];
+    let mut codes = Vec::new();
+    let mut vars = Vec::new();
+    for dir in DIRS {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if !name.ends_with(".fd") {
+                continue;
+            }
+            let path = entry.path();
+            if name.contains("code") {
+                codes.push(path);
+            } else if name.contains("var") {
+                vars.push(path);
+            } else if name == "ovmf.fd" {
+                codes.push(path);
+            }
+        }
+    }
+    let code = codes.into_iter().next()?;
+    let code_dir = code.parent().map(|p| p.to_path_buf());
+    let var = vars
+        .iter()
+        .find(|v| v.parent().map(|p| p.to_path_buf()) == code_dir)
+        .cloned()
+        .or_else(|| vars.into_iter().next());
+    Some((code.to_string_lossy().to_string(), var))
+}
+
+fn define_domain_with_uefi(conn: &Connect, xml: &str, name: &str, want_uefi: bool) -> Result<()> {
+    match conn.define_domain_xml(xml) {
+        Ok(_) => return Ok(()),
+        Err(first) if want_uefi => {
+            let Some((code, vars)) = find_ovmf() else {
+                return Err(anyhow!(
+                    "UEFI firmware (OVMF) not found: install ovmf/edk2-ovmf ({first})"
+                ));
+            };
+            let mut root = parse(xml)?;
+            if let Some(osel) = child_mut(&mut root, "os") {
+                osel.attributes.remove("firmware");
+                remove_children(osel, "loader");
+                remove_children(osel, "nvram");
+                remove_children(osel, "firmware");
+                let mut loader = Element::new("loader");
+                loader.attributes.insert("readonly".into(), "yes".into());
+                loader.attributes.insert("type".into(), "pflash".into());
+                set_el_text(&mut loader, &code);
+                let pos = osel
+                    .children
+                    .iter()
+                    .position(|n| matches!(n, XMLNode::Element(e) if e.name == "type"))
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                osel.children.insert(pos, XMLNode::Element(loader));
+                if let Some(vars_path) = vars {
+                    let dir = home_dir()
+                        .join("VirtualMachines")
+                        .join("vms")
+                        .join(safe_dir(name));
+                    std::fs::create_dir_all(&dir)?;
+                    let dst = dir.join("nvram_VARS.fd");
+                    if !dst.exists() {
+                        std::fs::copy(&vars_path, &dst)?;
+                    }
+                    let mut nv = Element::new("nvram");
+                    set_el_text(&mut nv, &dst.to_string_lossy());
+                    let pos = osel
+                        .children
+                        .iter()
+                        .position(|n| matches!(n, XMLNode::Element(e) if e.name == "loader"))
+                        .map(|i| i + 1)
+                        .unwrap_or(0);
+                    osel.children.insert(pos, XMLNode::Element(nv));
+                }
+            }
+            conn.define_domain_xml(&xml_string(&root)?)?;
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 impl Backend {
     pub fn connect(uri: &str) -> Result<Self> {
         let conn = Connect::open(Some(uri))?;
-        Ok(Self { conn, uri: uri.to_string(), cpu_cache: HashMap::new() })
+        Ok(Self {
+            conn,
+            uri: uri.to_string(),
+            cpu_cache: HashMap::new(),
+        })
     }
 
     pub fn uri(&self) -> &str {
@@ -180,8 +351,13 @@ impl Backend {
         };
         let mut vcpus = info.nr_virt_cpu;
         let mut maxmem_mb = (info.max_mem / 1024) as u32;
-        let xml = dom.xml_desc(if active { sys::VIR_DOMAIN_XML_INACTIVE } else { 0 })?;
+        let xml = dom.xml_desc(if active {
+            sys::VIR_DOMAIN_XML_INACTIVE
+        } else {
+            0
+        })?;
         let mut os_id = osdata::guess(&name).id.to_string();
+        let mut disk_size = 0;
         if let Ok(root) = parse(&xml) {
             if let Some(v) = child(&root, "vcpu").map(el_text) {
                 if let Ok(n) = v.trim().parse::<u32>() {
@@ -192,6 +368,7 @@ impl Backend {
             if m > 0 {
                 maxmem_mb = m;
             }
+            disk_size = disk_gb(&root);
             if let Some(desc) = child(&root, "description").map(el_text) {
                 if let Some(idx) = desc.find(OS_MARKER) {
                     let id = desc[idx + OS_MARKER.len()..]
@@ -213,6 +390,7 @@ impl Backend {
             live_vcpus: info.nr_virt_cpu,
             live_maxmem_mb: (info.max_mem / 1024) as u32,
             mem_mb: (info.memory / 1024) as u32,
+            disk_gb: disk_size,
             os_id,
             autostart: dom.autostart().unwrap_or(false),
         })
@@ -260,6 +438,14 @@ impl Backend {
 
     pub fn delete(&self, name: &str) -> Result<()> {
         let dom = self.find(name)?;
+        if let Ok(xml) = dom.xml_desc(sys::VIR_DOMAIN_XML_INACTIVE) {
+            let dir = home_dir()
+                .join("VirtualMachines")
+                .join("vms")
+                .join(safe_dir(name));
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join("domain.xml.bak"), xml);
+        }
         if dom.undefine().is_ok() {
             return Ok(());
         }
@@ -298,7 +484,8 @@ impl Backend {
                 }
             }
         }
-        self.cpu_cache.insert(name.to_string(), (now, info.cpu_time));
+        self.cpu_cache
+            .insert(name.to_string(), (now, info.cpu_time));
         Ok((pct.min(100.0), mem_mb, max_mb))
     }
 
@@ -311,15 +498,24 @@ impl Backend {
             .and_then(|t| t.trim().parse::<u32>().ok())
             .unwrap_or(1);
         let ram = mem_mib(child(&root, "memory"));
-        let kvm = root.attributes.get("type").map(|s| s == "kvm").unwrap_or(true);
+        let kvm = root
+            .attributes
+            .get("type")
+            .map(|s| s == "kvm")
+            .unwrap_or(true);
         let os_el = child(&root, "os");
         let machine = os_el
             .and_then(|o| child(o, "type"))
             .and_then(|t| t.attributes.get("machine").cloned())
             .unwrap_or_else(|| "pc".into());
         let uefi = os_el
-            .map(|o| o.attributes.get("firmware").map(|f| f == "efi").unwrap_or(false)
-                || child(o, "loader").is_some())
+            .map(|o| {
+                o.attributes
+                    .get("firmware")
+                    .map(|f| f == "efi")
+                    .unwrap_or(false)
+                    || child(o, "loader").is_some()
+            })
             .unwrap_or(false);
         let devices = child(&root, "devices");
         let tpm = devices.map(|d| child(d, "tpm").is_some()).unwrap_or(false);
@@ -328,7 +524,16 @@ impl Backend {
             .and_then(|v| child(v, "model"))
             .and_then(|m| m.attributes.get("type").cloned())
             .unwrap_or_else(|| "vga".into());
-        Ok(Hw { vcpu, ram, kvm, machine, uefi, tpm, video, autostart: dom.autostart().unwrap_or(false) })
+        Ok(Hw {
+            vcpu,
+            ram,
+            kvm,
+            machine,
+            uefi,
+            tpm,
+            video,
+            autostart: dom.autostart().unwrap_or(false),
+        })
     }
 
     pub fn hw_apply(&self, name: &str, hw: &Hw) -> Result<bool> {
@@ -346,7 +551,10 @@ impl Backend {
             }
         }
 
-        root.attributes.insert("type".into(), if hw.kvm { "kvm".into() } else { "qemu".into() });
+        root.attributes.insert(
+            "type".into(),
+            if hw.kvm { "kvm".into() } else { "qemu".into() },
+        );
         remove_children(&mut root, "cpu");
         if hw.kvm {
             let mut cpu = Element::new("cpu");
@@ -394,12 +602,18 @@ impl Backend {
                 let mut tpm = Element::new("tpm");
                 tpm.attributes.insert(
                     "model".into(),
-                    if hw.machine.contains("q35") { "tpm-crb".into() } else { "tpm-tis".into() },
+                    if hw.machine.contains("q35") {
+                        "tpm-crb".into()
+                    } else {
+                        "tpm-tis".into()
+                    },
                 );
                 let mut backend = Element::new("backend");
                 backend.attributes.insert("type".into(), "emulator".into());
                 backend.attributes.insert("version".into(), "2.0".into());
-                backend.attributes.insert("persistent_state".into(), "yes".into());
+                backend
+                    .attributes
+                    .insert("persistent_state".into(), "yes".into());
                 tpm.children.push(XMLNode::Element(backend));
                 devs.children.push(XMLNode::Element(tpm));
             }
@@ -417,7 +631,7 @@ impl Backend {
             }
         }
 
-        self.conn.define_domain_xml(&xml_string(&root)?)?;
+        define_domain_with_uefi(&self.conn, &xml_string(&root)?, name, hw.uefi)?;
         let mut deferred = false;
         if dom.is_active().unwrap_or(false) {
             if dom.set_memory(hw.ram as u64 * 1024).is_err() {
@@ -467,7 +681,11 @@ impl Backend {
             _ => "sda",
         };
         let cd_dev = if profile.bus == "ide" { "hdc" } else { "sdb" };
-        let cd_bus = if profile.bus == "virtio" { "sata" } else { profile.bus };
+        let cd_bus = if profile.bus == "virtio" {
+            "sata"
+        } else {
+            profile.bus
+        };
         let mut xml = String::new();
         xml.push_str(&format!(
             "<domain type='{}'><name>{}</name><description>{}{}</description>\
@@ -528,13 +746,19 @@ impl Backend {
             "<channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel>",
         );
         xml.push_str("<input type='tablet' bus='usb'/>");
-        xml.push_str("<graphics type='spice' autoport='yes' listen='127.0.0.1'>\
-                      <listen type='address' address='127.0.0.1'/></graphics>");
+        xml.push_str(
+            "<graphics type='spice' autoport='yes' listen='127.0.0.1'>\
+                      <listen type='address' address='127.0.0.1'/></graphics>",
+        );
         xml.push_str("<sound model='ich6'/>");
         xml.push_str(&format!(
             "<video><model type='{}' heads='1'{}/></video>",
             profile.video,
-            if profile.video == "qxl" { " ram='65536' vram='32768'" } else { " vram='16384'" }
+            if profile.video == "qxl" {
+                " ram='65536' vram='32768'"
+            } else {
+                " vram='16384'"
+            }
         ));
         if profile.tpm {
             xml.push_str(&format!(
@@ -544,14 +768,64 @@ impl Backend {
         }
         xml.push_str("<memballoon model='virtio'/></devices></domain>");
 
-        self.conn.define_domain_xml(&xml)?;
+        define_domain_with_uefi(&self.conn, &xml, name, profile.uefi)?;
+        Ok(())
+    }
+
+    pub fn snapshots(&self, name: &str) -> Result<Vec<SnapInfo>> {
+        let dom = self.find(name)?;
+        let mut out = Vec::new();
+        for snap in dom.list_all_snapshots(0)? {
+            let Ok(snap_name) = snap.name() else { continue };
+            let mut desc = String::new();
+            let mut created = String::new();
+            if let Ok(xml) = snap.xml_desc(0) {
+                if let Ok(root) = parse(&xml) {
+                    desc = child(&root, "description").map(el_text).unwrap_or_default();
+                    created = child(&root, "creationTime")
+                        .map(el_text)
+                        .unwrap_or_default();
+                }
+            }
+            out.push(SnapInfo {
+                name: snap_name,
+                desc,
+                created,
+            });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    pub fn snap_create(&self, name: &str, snapname: &str, desc: &str) -> Result<()> {
+        let dom = self.find(name)?;
+        let xml = format!(
+            "<domainsnapshot><name>{}</name><description>{}</description></domainsnapshot>",
+            esc(snapname),
+            esc(desc)
+        );
+        dom.create_snapshot_xml(&xml, 0)?;
+        Ok(())
+    }
+
+    pub fn snap_revert(&self, name: &str, snapname: &str) -> Result<()> {
+        let dom = self.find(name)?;
+        Domain::lookup_snapshot_by_name(&dom, snapname, 0)?.revert(0)?;
+        Ok(())
+    }
+
+    pub fn snap_delete(&self, name: &str, snapname: &str) -> Result<()> {
+        let dom = self.find(name)?;
+        Domain::lookup_snapshot_by_name(&dom, snapname, 0)?.delete(0)?;
         Ok(())
     }
 
     pub fn console(&self, name: &str) -> Result<()> {
         let exe = which("virt-viewer")
             .or_else(|| which("remote-viewer"))
-            .ok_or_else(|| anyhow!("virt-viewer not installed (install the virt-viewer package)"))?;
+            .ok_or_else(|| {
+                anyhow!("virt-viewer not installed (install the virt-viewer package)")
+            })?;
         Command::new(exe)
             .arg("-c")
             .arg(&self.uri)
@@ -562,7 +836,9 @@ impl Backend {
 }
 
 pub fn home_dir() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"))
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
 }
 
 pub fn iso_files() -> Vec<PathBuf> {
@@ -571,7 +847,10 @@ pub fn iso_files() -> Vec<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
             let p = e.path();
-            if p.extension().map(|x| x.eq_ignore_ascii_case("iso")).unwrap_or(false) {
+            if p.extension()
+                .map(|x| x.eq_ignore_ascii_case("iso"))
+                .unwrap_or(false)
+            {
                 out.push(p);
             }
         }

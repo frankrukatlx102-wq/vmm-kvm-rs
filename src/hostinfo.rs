@@ -14,7 +14,9 @@ pub fn host_limits() -> (u32, u32) {
             }
         }
     }
-    let cpus = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1);
     (ram_mb, cpus)
 }
 
