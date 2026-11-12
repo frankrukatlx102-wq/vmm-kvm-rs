@@ -83,6 +83,7 @@ enum BtnKind {
     Normal,
     Accent,
     Danger,
+    DangerSolid,
 }
 
 #[derive(Clone, Copy)]
@@ -3682,11 +3683,10 @@ impl VmmApp {
                                     })),
                             )
                             .child(
-                                button("confirm_yes", &dialog.confirm, BtnKind::Danger).on_click(
-                                    cx.listener(|this, _: &ClickEvent, _, cx| {
+                                button("confirm_yes", &dialog.confirm, BtnKind::DangerSolid)
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                         this.resolve_confirm(cx)
-                                    }),
-                                ),
+                                    })),
                             ),
                     ),
             )
@@ -3803,8 +3803,8 @@ fn os_icon(icon: &str, size_px: f32) -> impl IntoElement {
 fn button(id: &'static str, label: &str, kind: BtnKind) -> Stateful<Div> {
     let (bg, fg, border) = match kind {
         BtnKind::Accent => (col(ACCENT), col(0x062a26), col(ACCENT)),
-        BtnKind::Danger => (col(CARD), col(TEXT), col(BORDER)),
-        BtnKind::Normal => (col(CARD), col(TEXT), col(BORDER)),
+        BtnKind::Danger | BtnKind::Normal => (col(CARD), col(TEXT), col(BORDER)),
+        BtnKind::DangerSolid => (col(RED), col(0x2a0606), col(RED)),
     };
     div()
         .id(id)
@@ -3829,6 +3829,7 @@ fn button(id: &'static str, label: &str, kind: BtnKind) -> Stateful<Div> {
             BtnKind::Accent => this.bg(col(ACCENT_D)).border_color(col(ACCENT_D)),
             BtnKind::Danger => this.border_color(col(RED)).text_color(col(RED)),
             BtnKind::Normal => this.border_color(col(ACCENT_D)).text_color(col(ACCENT)),
+            BtnKind::DangerSolid => this.bg(col(0xdc2626)).border_color(col(0xdc2626)),
         })
         .child(label.to_string())
 }
