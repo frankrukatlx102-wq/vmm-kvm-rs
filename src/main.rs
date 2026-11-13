@@ -100,7 +100,17 @@ fn run_selftest() -> i32 {
     };
     cleanup_selftest(&b, &name);
     let profile = osdata::find("other");
-    if let Err(e) = b.create_vm(&name, profile, 1, 512, 5, "", true) {
+    let request = backend::VmRequest {
+        name: &name,
+        profile,
+        arch: "x86_64",
+        vcpu: 1,
+        ram_mb: 512,
+        disk_gb: 5,
+        iso: "",
+        kvm: true,
+    };
+    if let Err(e) = b.create_vm(&request) {
         println!("FAIL: create: {e}");
         cleanup_selftest(&b, &name);
         return 1;
@@ -223,8 +233,17 @@ fn run_selftest() -> i32 {
     cleanup_selftest(&b, &uefi_name);
     let uefi_ok = (|| -> Result<(), String> {
         let profile = osdata::find("ubuntu");
-        b.create_vm(&uefi_name, profile, 2, 2048, 10, "", true)
-            .map_err(|e| e.to_string())?;
+        b.create_vm(&backend::VmRequest {
+            name: &uefi_name,
+            profile,
+            arch: "x86_64",
+            vcpu: 2,
+            ram_mb: 2048,
+            disk_gb: 10,
+            iso: "",
+            kvm: true,
+        })
+        .map_err(|e| e.to_string())?;
         let hw = b.hw_read(&uefi_name).map_err(|e| e.to_string())?;
         if !hw.uefi {
             return Err("UEFI flag was not persisted".to_string());
@@ -243,15 +262,16 @@ fn run_selftest() -> i32 {
     let iso_ok = (|| -> Result<(), String> {
         std::fs::write(&iso_file, b"").map_err(|e| e.to_string())?;
         let profile = osdata::find("debian");
-        b.create_vm(
-            &iso_name,
+        b.create_vm(&backend::VmRequest {
+            name: &iso_name,
             profile,
-            2,
-            2048,
-            10,
-            &iso_file.to_string_lossy(),
-            true,
-        )
+            arch: "x86_64",
+            vcpu: 2,
+            ram_mb: 2048,
+            disk_gb: 10,
+            iso: &iso_file.to_string_lossy(),
+            kvm: true,
+        })
         .map_err(|e| e.to_string())?;
         let disks = b.disks(&iso_name).map_err(|e| e.to_string())?;
         if !disks
@@ -269,15 +289,16 @@ fn run_selftest() -> i32 {
     let legacy_name = format!("vmmself-rs-legacy-{}", std::process::id());
     cleanup_selftest(&b, &legacy_name);
     let legacy_ok = (|| -> Result<(), String> {
-        b.create_vm(
-            &legacy_name,
-            osdata::find("windows-7"),
-            2,
-            2048,
-            10,
-            "",
-            true,
-        )
+        b.create_vm(&backend::VmRequest {
+            name: &legacy_name,
+            profile: osdata::find("windows-7"),
+            arch: "x86_64",
+            vcpu: 2,
+            ram_mb: 2048,
+            disk_gb: 10,
+            iso: "",
+            kvm: true,
+        })
         .map_err(|e| e.to_string())?;
         let mut hw = b.hw_read(&legacy_name).map_err(|e| e.to_string())?;
         hw.uefi = true;
@@ -304,12 +325,114 @@ fn run_selftest() -> i32 {
     })();
     cleanup_selftest(&b, &legacy_name);
 
-    match (ok, uefi_ok, iso_ok, legacy_ok) {
-        (Ok(()), Ok(()), Ok(()), Ok(())) => {
+    let i686_name = format!("vmmself-rs-i686-{}", std::process::id());
+    let arm_name = format!("vmmself-rs-arm-{}", std::process::id());
+    let arch_name = format!("vmmself-rs-arch-{}", std::process::id());
+    cleanup_selftest(&b, &i686_name);
+    cleanup_selftest(&b, &arm_name);
+    cleanup_selftest(&b, &arch_name);
+    let arch_ok = (|| -> Result<(), String> {
+        b.create_vm(&backend::VmRequest {
+            name: &i686_name,
+            profile: osdata::find("other"),
+            arch: "i686",
+            vcpu: 2,
+            ram_mb: 1024,
+            disk_gb: 5,
+            iso: "",
+            kvm: true,
+        })
+        .map_err(|e| format!("i686 create: {e}"))?;
+        let hw = b.hw_read(&i686_name).map_err(|e| e.to_string())?;
+        if hw.arch != "i686" {
+            return Err(format!("i686 arch readback: {}", hw.arch));
+        }
+        b.start(&i686_name)
+            .map_err(|e| format!("i686 start: {e}"))?;
+        std::thread::sleep(Duration::from_secs(1));
+        b.force_off(&i686_name).map_err(|e| e.to_string())?;
+        println!("ok: i686 VM creation and start");
+
+        b.create_vm(&backend::VmRequest {
+            name: &arm_name,
+            profile: osdata::find("linux"),
+            arch: "aarch64",
+            vcpu: 2,
+            ram_mb: 2048,
+            disk_gb: 5,
+            iso: "",
+            kvm: false,
+        })
+        .map_err(|e| format!("aarch64 create: {e}"))?;
+        let hw = b.hw_read(&arm_name).map_err(|e| e.to_string())?;
+        if hw.arch != "aarch64" || !hw.uefi || !hw.machine.contains("virt") {
+            return Err(format!(
+                "ARM readback: arch={} uefi={} machine={}",
+                hw.arch, hw.uefi, hw.machine
+            ));
+        }
+        b.start(&arm_name)
+            .map_err(|e| format!("aarch64 start: {e}"))?;
+        std::thread::sleep(Duration::from_secs(1));
+        b.force_off(&arm_name).map_err(|e| e.to_string())?;
+        println!("ok: ARM64 UEFI VM creation and start");
+
+        b.create_vm(&backend::VmRequest {
+            name: &arch_name,
+            profile: osdata::find("other"),
+            arch: "x86_64",
+            vcpu: 2,
+            ram_mb: 1024,
+            disk_gb: 5,
+            iso: "",
+            kvm: true,
+        })
+        .map_err(|e| format!("arch conversion create: {e}"))?;
+        let mut hw = b.hw_read(&arch_name).map_err(|e| e.to_string())?;
+        hw.arch = "i686".into();
+        b.hw_apply(&arch_name, &hw)
+            .map_err(|e| format!("x86_64 -> i686: {e}"))?;
+        let hw = b.hw_read(&arch_name).map_err(|e| e.to_string())?;
+        if hw.arch != "i686" {
+            return Err("i686 conversion was not persisted".to_string());
+        }
+        let mut hw = hw;
+        hw.arch = "aarch64".into();
+        b.hw_apply(&arch_name, &hw)
+            .map_err(|e| format!("i686 -> aarch64: {e}"))?;
+        let hw = b.hw_read(&arch_name).map_err(|e| e.to_string())?;
+        if hw.arch != "aarch64" || !hw.uefi || !hw.machine.contains("virt") {
+            return Err("ARM conversion was not persisted".to_string());
+        }
+        let mut hw = hw;
+        hw.arch = "x86_64".into();
+        b.hw_apply(&arch_name, &hw)
+            .map_err(|e| format!("aarch64 -> x86_64: {e}"))?;
+        let hw = b.hw_read(&arch_name).map_err(|e| e.to_string())?;
+        if hw.arch != "x86_64" {
+            return Err("x86_64 conversion was not persisted".to_string());
+        }
+        b.start(&arch_name)
+            .map_err(|e| format!("converted x86_64 start: {e}"))?;
+        std::thread::sleep(Duration::from_secs(1));
+        b.force_off(&arch_name).map_err(|e| e.to_string())?;
+        println!("ok: architecture conversion x86_64 -> i686 -> aarch64 -> x86_64");
+        Ok(())
+    })();
+    cleanup_selftest(&b, &i686_name);
+    cleanup_selftest(&b, &arm_name);
+    cleanup_selftest(&b, &arch_name);
+
+    match (ok, uefi_ok, iso_ok, legacy_ok, arch_ok) {
+        (Ok(()), Ok(()), Ok(()), Ok(()), Ok(())) => {
             println!("SELFTEST PASS");
             0
         }
-        (Err(e), _, _, _) | (_, Err(e), _, _) | (_, _, Err(e), _) | (_, _, _, Err(e)) => {
+        (Err(e), _, _, _, _)
+        | (_, Err(e), _, _, _)
+        | (_, _, Err(e), _, _)
+        | (_, _, _, Err(e), _)
+        | (_, _, _, _, Err(e)) => {
             println!("FAIL: {e}");
             println!("SELFTEST FAIL");
             1

@@ -14,9 +14,23 @@ use crate::hostinfo;
 use crate::osdata::{self, OsProfile};
 
 pub const OS_MARKER: &str = "VMM-KVM:os=";
+pub const ARCHES: [&str; 3] = ["x86_64", "i686", "aarch64"];
+
+#[derive(Clone)]
+pub struct VmRequest<'a> {
+    pub name: &'a str,
+    pub profile: &'a OsProfile,
+    pub arch: &'a str,
+    pub vcpu: u32,
+    pub ram_mb: u32,
+    pub disk_gb: u32,
+    pub iso: &'a str,
+    pub kvm: bool,
+}
 
 #[derive(Clone)]
 pub struct Hw {
+    pub arch: String,
     pub vcpu: u32,
     pub ram: u32,
     pub kvm: bool,
@@ -256,13 +270,53 @@ fn find_ovmf() -> Option<(String, Option<PathBuf>)> {
     Some((code.to_string_lossy().to_string(), var))
 }
 
-fn define_domain_with_uefi(conn: &Connect, xml: &str, name: &str, want_uefi: bool) -> Result<()> {
+fn find_aarch64_firmware() -> Option<(String, Option<PathBuf>)> {
+    const DIRS: &[&str] = &[
+        "/usr/share/edk2/aarch64",
+        "/usr/share/AAVMF",
+        "/usr/share/edk2-armvirt",
+    ];
+    const CODES: &[&str] = &["QEMU_EFI.fd", "AAVMF_CODE.fd", "AAVMF_CODE.ms.fd"];
+    const VARS: &[&str] = &["QEMU_VARS.fd", "AAVMF_VARS.fd"];
+    for dir in DIRS {
+        let base = PathBuf::from(dir);
+        let Some(code) = CODES
+            .iter()
+            .map(|name| base.join(name))
+            .find(|path| path.is_file())
+        else {
+            continue;
+        };
+        let vars = VARS
+            .iter()
+            .map(|name| base.join(name))
+            .find(|path| path.is_file());
+        return Some((code.to_string_lossy().to_string(), vars));
+    }
+    None
+}
+
+fn find_firmware(arch: &str) -> Option<(String, Option<PathBuf>)> {
+    if arch == "aarch64" {
+        find_aarch64_firmware()
+    } else {
+        find_ovmf()
+    }
+}
+
+fn define_domain_with_uefi(
+    conn: &Connect,
+    xml: &str,
+    name: &str,
+    want_uefi: bool,
+    arch: &str,
+) -> Result<()> {
     match conn.define_domain_xml(xml) {
         Ok(_) => return Ok(()),
         Err(first) if want_uefi => {
-            let Some((code, vars)) = find_ovmf() else {
+            let Some((code, vars)) = find_firmware(arch) else {
                 return Err(anyhow!(
-                    "UEFI firmware (OVMF) not found: install ovmf/edk2-ovmf ({first})"
+                    "UEFI firmware not found: install ovmf/edk2-ovmf or edk2-aarch64 ({first})"
                 ));
             };
             let mut root = parse(xml)?;
@@ -423,6 +477,145 @@ fn interface_element(
     model_el.attributes.insert("type".into(), model.into());
     iface.children.push(XMLNode::Element(model_el));
     iface
+}
+
+pub fn arch_available(arch: &str) -> bool {
+    let binary = match arch {
+        "x86_64" => "qemu-system-x86_64",
+        "i686" => "qemu-system-i386",
+        "aarch64" => "qemu-system-aarch64",
+        _ => return false,
+    };
+    which(binary).is_some()
+}
+
+pub fn arch_native(arch: &str) -> bool {
+    match arch {
+        "x86_64" => cfg!(target_arch = "x86_64"),
+        "i686" => cfg!(target_arch = "x86_64") || cfg!(target_arch = "x86"),
+        "aarch64" => cfg!(target_arch = "aarch64"),
+        _ => false,
+    }
+}
+
+pub fn machine_for_arch(arch: &str, requested: &str) -> String {
+    match arch {
+        "aarch64" => "virt".into(),
+        "i686" => "pc".into(),
+        _ => {
+            if requested.contains("q35") {
+                "q35".into()
+            } else if requested.contains("pc") {
+                requested.to_string()
+            } else {
+                "q35".into()
+            }
+        }
+    }
+}
+
+fn domain_arch(root: &Element) -> String {
+    child(root, "os")
+        .and_then(|osel| child(osel, "type"))
+        .and_then(|element| element.attributes.get("arch").cloned())
+        .unwrap_or_else(|| "x86_64".into())
+}
+
+fn domain_machine(root: &Element) -> String {
+    child(root, "os")
+        .and_then(|osel| child(osel, "type"))
+        .and_then(|element| element.attributes.get("machine").cloned())
+        .unwrap_or_default()
+}
+
+fn convert_arch_devices(root: &mut Element, old_arch: &str, new_arch: &str) {
+    if old_arch == new_arch {
+        return;
+    }
+    remove_children(root, "clock");
+    let Some(devices) = child_mut(root, "devices") else {
+        return;
+    };
+    devices.children.retain(|node| {
+        let XMLNode::Element(element) = node else {
+            return true;
+        };
+        element.name != "emulator"
+            && !(new_arch == "aarch64" && element.name == "sound")
+            && !(new_arch == "aarch64"
+                && element.name == "input"
+                && element
+                    .attributes
+                    .get("bus")
+                    .map(|bus| bus == "ps2")
+                    .unwrap_or(false))
+    });
+    devices.children.retain(|node| {
+        !matches!(node, XMLNode::Element(element) if element.name == "serial" || element.name == "console")
+    });
+    if new_arch == "aarch64" {
+        let mut disk_index = 0u8;
+        let mut cd_index = 0u8;
+        for node in &mut devices.children {
+            let XMLNode::Element(disk) = node else {
+                continue;
+            };
+            if disk.name != "disk" {
+                continue;
+            }
+            let cdrom = disk
+                .attributes
+                .get("device")
+                .map(|device| device == "cdrom")
+                .unwrap_or(false);
+            let Some(target) = child_mut(disk, "target") else {
+                continue;
+            };
+            if cdrom {
+                target.attributes.insert("bus".into(), "sata".into());
+                target
+                    .attributes
+                    .insert("dev".into(), format!("sd{}", (b'a' + cd_index) as char));
+                cd_index = cd_index.saturating_add(1);
+            } else {
+                target.attributes.insert("bus".into(), "virtio".into());
+                target
+                    .attributes
+                    .insert("dev".into(), format!("vd{}", (b'a' + disk_index) as char));
+                disk_index = disk_index.saturating_add(1);
+            }
+        }
+        let has_usb = devices.children.iter().any(|node| {
+            matches!(node, XMLNode::Element(element)
+                if element.name == "controller"
+                    && element.attributes.get("type").map(|kind| kind == "usb").unwrap_or(false))
+        });
+        if !has_usb {
+            let mut usb = Element::new("controller");
+            usb.attributes.insert("type".into(), "usb".into());
+            usb.attributes.insert("index".into(), "0".into());
+            usb.attributes.insert("model".into(), "qemu-xhci".into());
+            devices.children.push(XMLNode::Element(usb));
+        }
+        let has_tablet = devices.children.iter().any(|node| {
+            matches!(node, XMLNode::Element(element)
+                if element.name == "input"
+                    && element.attributes.get("type").map(|kind| kind == "tablet").unwrap_or(false))
+        });
+        if !has_tablet {
+            let mut tablet = Element::new("input");
+            tablet.attributes.insert("type".into(), "tablet".into());
+            tablet.attributes.insert("bus".into(), "usb".into());
+            devices.children.push(XMLNode::Element(tablet));
+        }
+    }
+    let mut console = Element::new("console");
+    console.attributes.insert("type".into(), "pty".into());
+    let mut target = Element::new("target");
+    target.attributes.insert("type".into(), "serial".into());
+    target.attributes.insert("port".into(), "0".into());
+    console.children.push(XMLNode::Element(target));
+    devices.children.push(XMLNode::Element(console));
 }
 
 fn convert_machine_devices(root: &mut Element, old_machine: &str, new_machine: &str) {
@@ -621,6 +814,12 @@ impl Backend {
             let _ = std::fs::create_dir_all(&dir);
             let _ = std::fs::write(dir.join("domain.xml.bak"), xml);
         }
+        let flags = sys::VIR_DOMAIN_UNDEFINE_NVRAM
+            | sys::VIR_DOMAIN_UNDEFINE_SNAPSHOTS_METADATA
+            | sys::VIR_DOMAIN_UNDEFINE_MANAGED_SAVE;
+        if dom.undefine_flags(flags).is_ok() {
+            return Ok(());
+        }
         if dom.undefine().is_ok() {
             return Ok(());
         }
@@ -700,6 +899,7 @@ impl Backend {
             .and_then(|m| m.attributes.get("type").cloned())
             .unwrap_or_else(|| "vga".into());
         Ok(Hw {
+            arch: domain_arch(&root),
             vcpu,
             ram,
             kvm,
@@ -715,6 +915,40 @@ impl Backend {
         let dom = self.find(name)?;
         let xml = dom.xml_desc(sys::VIR_DOMAIN_XML_INACTIVE)?;
         let mut root = parse(&xml)?;
+        let old_arch = domain_arch(&root);
+        let old_machine = domain_machine(&root);
+        let arch = if hw.arch.is_empty() {
+            "x86_64"
+        } else {
+            hw.arch.as_str()
+        };
+        if !ARCHES.contains(&arch) {
+            return Err(anyhow!("unsupported architecture: {arch}"));
+        }
+        let active = dom.is_active().unwrap_or(false);
+        let machine = machine_for_arch(arch, &hw.machine);
+        let arch_changed = old_arch != arch;
+        let machine_changed = old_machine != machine;
+        if active && (arch_changed || machine_changed) {
+            return Err(anyhow!(
+                "stop the VM before changing architecture or machine type"
+            ));
+        }
+        let native = arch_native(arch);
+        let kvm = hw.kvm && native;
+        let uefi = if arch == "aarch64" {
+            true
+        } else if arch == "i686" {
+            false
+        } else {
+            hw.uefi
+        };
+        let tpm = hw.tpm && arch == "x86_64";
+        let video = if arch == "aarch64" {
+            "virtio"
+        } else {
+            hw.video.as_str()
+        };
 
         if let Some(v) = child_mut(&mut root, "vcpu") {
             set_el_text(v, &hw.vcpu.to_string());
@@ -728,39 +962,49 @@ impl Backend {
 
         root.attributes.insert(
             "type".into(),
-            if hw.kvm { "kvm".into() } else { "qemu".into() },
+            if kvm { "kvm".into() } else { "qemu".into() },
         );
         remove_children(&mut root, "cpu");
-        if hw.kvm {
+        if kvm {
             let mut cpu = Element::new("cpu");
             cpu.attributes.insert("mode".into(), "host-model".into());
             cpu.attributes.insert("check".into(), "partial".into());
             root.children.push(XMLNode::Element(cpu));
         }
+        if arch_changed {
+            remove_children(&mut root, "clock");
+        }
 
-        let old_machine = child(&root, "os")
-            .and_then(|o| child(o, "type"))
-            .and_then(|t| t.attributes.get("machine").cloned())
-            .unwrap_or_default();
         if let Some(osel) = child_mut(&mut root, "os") {
             if let Some(t) = child_mut(osel, "type") {
-                t.attributes.insert("machine".into(), hw.machine.clone());
+                t.attributes.insert("arch".into(), arch.into());
+                t.attributes.insert("machine".into(), machine.clone());
             }
             osel.attributes.remove("firmware");
             remove_children(osel, "loader");
             remove_children(osel, "nvram");
             remove_children(osel, "firmware");
-            if hw.uefi {
+            if uefi {
                 osel.attributes.insert("firmware".into(), "efi".into());
             }
         }
-        if old_machine != hw.machine {
-            convert_machine_devices(&mut root, &old_machine, &hw.machine);
+        if machine_changed {
+            convert_machine_devices(&mut root, &old_machine, &machine);
+        }
+        if arch_changed {
+            convert_arch_devices(&mut root, &old_arch, arch);
         }
 
         if let Some(feats) = child_mut(&mut root, "features") {
             remove_children(feats, "smm");
-            if hw.uefi && hw.tpm {
+            if arch == "aarch64" {
+                for tag in ["hyperv", "kvm", "vmport"] {
+                    remove_children(feats, tag);
+                }
+            } else {
+                remove_children(feats, "gic");
+            }
+            if uefi && tpm && arch == "x86_64" {
                 let mut smm = Element::new("smm");
                 smm.attributes.insert("state".into(), "on".into());
                 feats.children.push(XMLNode::Element(smm));
@@ -769,11 +1013,11 @@ impl Backend {
 
         if let Some(devs) = child_mut(&mut root, "devices") {
             remove_children(devs, "tpm");
-            if hw.tpm {
+            if tpm {
                 let mut tpm = Element::new("tpm");
                 tpm.attributes.insert(
                     "model".into(),
-                    if hw.machine.contains("q35") {
+                    if machine.contains("q35") {
                         "tpm-crb".into()
                     } else {
                         "tpm-tis".into()
@@ -788,11 +1032,26 @@ impl Backend {
                 tpm.children.push(XMLNode::Element(backend));
                 devs.children.push(XMLNode::Element(tpm));
             }
-            if let Some(video) = child_mut(devs, "video") {
-                if let Some(model) = child_mut(video, "model") {
-                    model.attributes.insert("type".into(), hw.video.clone());
+            if arch == "aarch64" {
+                remove_children(devs, "sound");
+                remove_children(devs, "video");
+            }
+            if child_mut(devs, "video").is_none() {
+                let mut video_el = Element::new("video");
+                let mut model = Element::new("model");
+                model.attributes.insert("type".into(), video.into());
+                model.attributes.insert("heads".into(), "1".into());
+                video_el.children.push(XMLNode::Element(model));
+                devs.children.push(XMLNode::Element(video_el));
+            }
+            if let Some(video_el) = child_mut(devs, "video") {
+                if let Some(model) = child_mut(video_el, "model") {
+                    model.attributes.insert("type".into(), video.into());
                     model.attributes.insert("heads".into(), "1".into());
-                    if hw.video == "qxl" {
+                    if arch == "aarch64" {
+                        model.attributes.remove("ram");
+                        model.attributes.remove("vram");
+                    } else if video == "qxl" {
                         model.attributes.insert("ram".into(), "65536".into());
                         model.attributes.insert("vram".into(), "32768".into());
                     } else {
@@ -802,9 +1061,10 @@ impl Backend {
             }
         }
 
-        define_domain_with_uefi(&self.conn, &xml_string(&root)?, name, hw.uefi)?;
+        let xml = xml_string(&root)?;
+        define_domain_with_uefi(&self.conn, &xml, name, uefi, arch)?;
         let mut deferred = false;
-        if dom.is_active().unwrap_or(false) {
+        if active {
             if dom.set_memory(hw.ram as u64 * 1024).is_err() {
                 deferred = true;
             }
@@ -816,16 +1076,16 @@ impl Backend {
         Ok(deferred)
     }
 
-    pub fn create_vm(
-        &self,
-        name: &str,
-        profile: &OsProfile,
-        vcpu: u32,
-        ram_mb: u32,
-        disk_gb: u32,
-        iso: &str,
-        kvm: bool,
-    ) -> Result<()> {
+    pub fn create_vm(&self, req: &VmRequest<'_>) -> Result<()> {
+        let name = req.name;
+        let profile = req.profile;
+        let arch = req.arch;
+        if !ARCHES.contains(&arch) {
+            return Err(anyhow!("unsupported architecture: {arch}"));
+        }
+        if !arch_available(arch) {
+            return Err(anyhow!("QEMU for {arch} is not installed"));
+        }
         if self.find(name).is_ok() {
             return Err(anyhow!("name already taken: {name}"));
         }
@@ -839,44 +1099,70 @@ impl Backend {
         let status = Command::new("qemu-img")
             .args(["create", "-f", "qcow2"])
             .arg(&disk)
-            .arg(format!("{disk_gb}G"))
+            .arg(format!("{}G", req.disk_gb))
             .status()?;
         if !status.success() {
             return Err(anyhow!("qemu-img failed"));
         }
 
-        let machine = profile.machine;
-        let disk_dev = match profile.bus {
-            "virtio" => "vda",
-            "ide" => "hda",
-            _ => "sda",
-        };
-        let cd_dev = if profile.bus == "ide" { "hdc" } else { "sdb" };
-        let cd_bus = if profile.bus == "virtio" {
-            "sata"
+        let native = arch_native(arch);
+        let kvm = req.kvm && native;
+        let uefi = if arch == "aarch64" {
+            true
+        } else if arch == "i686" {
+            false
         } else {
-            profile.bus
+            profile.uefi
         };
+        let tpm = profile.tpm && arch == "x86_64" && uefi;
+        let machine = match arch {
+            "aarch64" => "virt",
+            "i686" => "pc",
+            _ => profile.machine,
+        };
+        let (disk_bus, disk_dev, cd_bus, cd_dev) = if arch == "aarch64" {
+            ("virtio", "vda", "sata", "sdb")
+        } else {
+            let bus = profile.bus;
+            let disk_dev = match bus {
+                "virtio" => "vda",
+                "ide" => "hda",
+                _ => "sda",
+            };
+            let cd_bus = if bus == "ide" { "ide" } else { "sata" };
+            let cd_dev = if bus == "ide" { "hdc" } else { "sdb" };
+            (bus, disk_dev, cd_bus, cd_dev)
+        };
+        let net = if arch == "aarch64" {
+            "virtio"
+        } else {
+            profile.net
+        };
+        let video = if arch == "aarch64" {
+            "virtio"
+        } else {
+            profile.video
+        };
+
         let mut xml = String::new();
         xml.push_str(&format!(
-            "<domain type='{}'><name>{}</name><description>{}{}</description>\
-             <memory unit='MiB'>{}</memory><currentMemory unit='MiB'>{}</currentMemory>\
-             <vcpu placement='static'>{}</vcpu>",
+            "<domain type='{}'><name>{}</name><description>{}{}</description>             <memory unit='MiB'>{}</memory><currentMemory unit='MiB'>{}</currentMemory>             <vcpu placement='static'>{}</vcpu>",
             if kvm { "kvm" } else { "qemu" },
             esc(name),
             OS_MARKER,
             esc(profile.id),
-            ram_mb,
-            ram_mb,
-            vcpu
+            req.ram_mb,
+            req.ram_mb,
+            req.vcpu
         ));
         xml.push_str(&format!(
-            "<os{0}><type arch='x86_64' machine='{1}'>hvm</type><boot dev='cdrom'/><boot dev='hd'/></os>",
-            if profile.uefi { " firmware='efi'" } else { "" },
+            "<os{0}><type arch='{1}' machine='{2}'>hvm</type><boot dev='cdrom'/><boot dev='hd'/></os>",
+            if uefi { " firmware='efi'" } else { "" },
+            arch,
             machine
         ));
         xml.push_str("<features><acpi/><apic/>");
-        if profile.uefi && profile.tpm {
+        if uefi && tpm {
             xml.push_str("<smm state='on'/>");
         }
         xml.push_str("</features>");
@@ -885,17 +1171,15 @@ impl Backend {
         }
         xml.push_str("<devices>");
         xml.push_str(&format!(
-            "<disk type='file' device='disk'><driver name='qemu' type='qcow2'/>\
-             <source file='{}'/><target dev='{}' bus='{}'/></disk>",
+            "<disk type='file' device='disk'><driver name='qemu' type='qcow2'/>             <source file='{}'/><target dev='{}' bus='{}'/></disk>",
             esc(&disk.to_string_lossy()),
             disk_dev,
-            profile.bus
+            disk_bus
         ));
-        if !iso.is_empty() {
+        if !req.iso.is_empty() {
             xml.push_str(&format!(
-                "<disk type='file' device='cdrom'><source file='{}'/>\
-                 <target dev='{}' bus='{}'/><readonly/></disk>",
-                esc(iso),
+                "<disk type='file' device='cdrom'><source file='{}'/>                 <target dev='{}' bus='{}'/><readonly/></disk>",
+                esc(req.iso),
                 cd_dev,
                 cd_bus
             ));
@@ -903,43 +1187,50 @@ impl Backend {
         if self.is_session() {
             xml.push_str(&format!(
                 "<interface type='user'><model type='{}'/></interface>",
-                profile.net
+                net
             ));
         } else {
             xml.push_str(&format!(
-                "<interface type='network'><source network='default'/>\
-                 <model type='{}'/></interface>",
-                profile.net
+                "<interface type='network'><source network='default'/>                 <model type='{}'/></interface>",
+                net
             ));
         }
         xml.push_str("<console type='pty'><target type='serial' port='0'/></console>");
         xml.push_str(
             "<channel type='unix'><target type='virtio' name='org.qemu.guest_agent.0'/></channel>",
         );
+        if arch == "aarch64" {
+            xml.push_str("<controller type='usb' index='0' model='qemu-xhci'/>");
+        }
         xml.push_str("<input type='tablet' bus='usb'/>");
         xml.push_str(
-            "<graphics type='spice' autoport='yes' listen='127.0.0.1'>\
-                      <listen type='address' address='127.0.0.1'/></graphics>",
+            "<graphics type='spice' autoport='yes' listen='127.0.0.1'>                      <listen type='address' address='127.0.0.1'/></graphics>",
         );
-        xml.push_str("<sound model='ich6'/>");
+        if arch != "aarch64" {
+            xml.push_str("<sound model='ich6'/>");
+        }
         xml.push_str(&format!(
             "<video><model type='{}' heads='1'{}/></video>",
-            profile.video,
-            if profile.video == "qxl" {
+            video,
+            if video == "qxl" {
                 " ram='65536' vram='32768'"
             } else {
                 " vram='16384'"
             }
         ));
-        if profile.tpm {
+        if tpm {
             xml.push_str(&format!(
                 "<tpm model='{}'><backend type='emulator' version='2.0' persistent_state='yes'/></tpm>",
-                if machine.contains("q35") { "tpm-crb" } else { "tpm-tis" }
+                if machine.contains("q35") {
+                    "tpm-crb"
+                } else {
+                    "tpm-tis"
+                }
             ));
         }
         xml.push_str("<memballoon model='virtio'/></devices></domain>");
 
-        define_domain_with_uefi(&self.conn, &xml, name, profile.uefi)?;
+        define_domain_with_uefi(&self.conn, &xml, name, uefi, arch)?;
         Ok(())
     }
 
@@ -1067,7 +1358,14 @@ impl Backend {
         if let Some(devices) = child_mut(&mut root, "devices") {
             devices.children.push(XMLNode::Element(disk));
         }
-        define_domain_with_uefi(&self.conn, &xml_string(&root)?, name, root_uefi(&root))?;
+        let arch = domain_arch(&root);
+        define_domain_with_uefi(
+            &self.conn,
+            &xml_string(&root)?,
+            name,
+            root_uefi(&root),
+            &arch,
+        )?;
         if dom.is_active().unwrap_or(false) {
             let _ = dom.attach_device_flags(&disk_xml, sys::VIR_DOMAIN_AFFECT_LIVE);
         }
@@ -1106,7 +1404,14 @@ impl Backend {
             return Err(anyhow!("disk not found: {target}"));
         };
         let removed_xml = xml_string(&removed)?;
-        define_domain_with_uefi(&self.conn, &xml_string(&root)?, name, root_uefi(&root))?;
+        let arch = domain_arch(&root);
+        define_domain_with_uefi(
+            &self.conn,
+            &xml_string(&root)?,
+            name,
+            root_uefi(&root),
+            &arch,
+        )?;
         if dom.is_active().unwrap_or(false) {
             let _ = dom.detach_device_flags(&removed_xml, sys::VIR_DOMAIN_AFFECT_LIVE);
         }
@@ -1183,7 +1488,14 @@ impl Backend {
                 devices.children.push(XMLNode::Element(disk));
             }
         }
-        define_domain_with_uefi(&self.conn, &xml_string(&root)?, name, root_uefi(&root))?;
+        let arch = domain_arch(&root);
+        define_domain_with_uefi(
+            &self.conn,
+            &xml_string(&root)?,
+            name,
+            root_uefi(&root),
+            &arch,
+        )?;
         if dom.is_active().unwrap_or(false) {
             if let Some(disk) = changed {
                 let disk_xml = xml_string(&disk)?;
@@ -1260,7 +1572,14 @@ impl Backend {
         if let Some(devices) = child_mut(&mut root, "devices") {
             devices.children.push(XMLNode::Element(iface));
         }
-        define_domain_with_uefi(&self.conn, &xml_string(&root)?, name, root_uefi(&root))?;
+        let arch = domain_arch(&root);
+        define_domain_with_uefi(
+            &self.conn,
+            &xml_string(&root)?,
+            name,
+            root_uefi(&root),
+            &arch,
+        )?;
         if dom.is_active().unwrap_or(false) {
             let _ = dom.attach_device_flags(&iface_xml, sys::VIR_DOMAIN_AFFECT_LIVE);
         }
@@ -1299,7 +1618,14 @@ impl Backend {
             return Err(anyhow!("interface not found: {mac}"));
         };
         let removed_xml = xml_string(&removed)?;
-        define_domain_with_uefi(&self.conn, &xml_string(&root)?, name, root_uefi(&root))?;
+        let arch = domain_arch(&root);
+        define_domain_with_uefi(
+            &self.conn,
+            &xml_string(&root)?,
+            name,
+            root_uefi(&root),
+            &arch,
+        )?;
         if dom.is_active().unwrap_or(false) {
             let _ = dom.detach_device_flags(&removed_xml, sys::VIR_DOMAIN_AFFECT_LIVE);
         }

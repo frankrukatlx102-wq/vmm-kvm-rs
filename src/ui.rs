@@ -132,6 +132,7 @@ struct VmStat {
 }
 
 struct CreateForm {
+    arch: String,
     isos: Vec<PathBuf>,
     iso: Option<PathBuf>,
     profile_id: String,
@@ -145,7 +146,13 @@ struct CreateForm {
 
 impl CreateForm {
     fn new(help_ram: u32, help_cpus: u32, kvm: bool) -> Self {
+        let arch = if cfg!(target_arch = "aarch64") {
+            "aarch64"
+        } else {
+            "x86_64"
+        };
         Self {
+            arch: arch.into(),
             isos: backend::iso_files(),
             iso: None,
             profile_id: "other".into(),
@@ -573,6 +580,12 @@ impl VmmApp {
         cx.notify();
     }
 
+    fn form_select_arch(&mut self, arch: &'static str, cx: &mut Context<Self>) {
+        self.form.arch = arch.into();
+        self.form.kvm = self.kvm_ok && backend::arch_native(arch);
+        cx.notify();
+    }
+
     fn form_select_profile(&mut self, id: &'static str, cx: &mut Context<Self>) {
         let profile = osdata::find(id);
         self.form.profile_id = profile.id.to_string();
@@ -679,14 +692,23 @@ impl VmmApp {
             .map(|path| path.to_string_lossy().to_string())
             .unwrap_or_default();
         let profile = osdata::find(&self.form.profile_id);
-        let (vcpu, ram, disk, kvm) = (self.form.vcpu, self.form.ram, self.form.disk, self.form.kvm);
+        let request = backend::VmRequest {
+            name: &name,
+            profile,
+            arch: &self.form.arch,
+            vcpu: self.form.vcpu,
+            ram_mb: self.form.ram,
+            disk_gb: self.form.disk,
+            iso: &iso,
+            kvm: self.form.kvm,
+        };
         let res = {
             let Some(b) = self.backend.as_ref() else {
                 self.set_status(self.t("err.not_connected").to_string(), StatusKind::Error);
                 cx.notify();
                 return;
             };
-            b.create_vm(&name, profile, vcpu, ram, disk, &iso, kvm)
+            b.create_vm(&request)
         };
         match res {
             Ok(()) => {
@@ -823,6 +845,14 @@ impl VmmApp {
     }
 
     fn hw_toggle_kvm(&mut self, cx: &mut Context<Self>) {
+        let Some(hw) = self.hw.as_ref() else {
+            return;
+        };
+        if !backend::arch_native(&hw.arch) {
+            self.set_status(self.t("hw.kvm_foreign").to_string(), StatusKind::Info);
+            cx.notify();
+            return;
+        }
         if let Some(hw) = self.hw.as_mut() {
             hw.kvm = !hw.kvm;
             cx.notify();
@@ -830,6 +860,19 @@ impl VmmApp {
     }
 
     fn hw_toggle_uefi(&mut self, cx: &mut Context<Self>) {
+        let Some(hw) = self.hw.as_ref() else {
+            return;
+        };
+        if hw.arch == "aarch64" {
+            self.set_status(self.t("hw.uefi_arm").to_string(), StatusKind::Info);
+            cx.notify();
+            return;
+        }
+        if hw.arch == "i686" {
+            self.set_status(self.t("hw.uefi_i686").to_string(), StatusKind::Info);
+            cx.notify();
+            return;
+        }
         if let Some(hw) = self.hw.as_mut() {
             hw.uefi = !hw.uefi;
             cx.notify();
@@ -837,6 +880,14 @@ impl VmmApp {
     }
 
     fn hw_toggle_tpm(&mut self, cx: &mut Context<Self>) {
+        let Some(hw) = self.hw.as_ref() else {
+            return;
+        };
+        if hw.arch != "x86_64" {
+            self.set_status(self.t("hw.tpm_arch").to_string(), StatusKind::Info);
+            cx.notify();
+            return;
+        }
         if let Some(hw) = self.hw.as_mut() {
             hw.tpm = !hw.tpm;
             cx.notify();
@@ -851,6 +902,14 @@ impl VmmApp {
     }
 
     fn hw_cycle_video(&mut self, cx: &mut Context<Self>) {
+        let Some(hw) = self.hw.as_ref() else {
+            return;
+        };
+        if hw.arch == "aarch64" {
+            self.set_status(self.t("hw.video_arm").to_string(), StatusKind::Info);
+            cx.notify();
+            return;
+        }
         if let Some(hw) = self.hw.as_mut() {
             hw.video = match hw.video.as_str() {
                 "qxl" => "virtio".into(),
@@ -862,12 +921,63 @@ impl VmmApp {
     }
 
     fn hw_cycle_machine(&mut self, cx: &mut Context<Self>) {
+        let Some(hw) = self.hw.as_ref() else {
+            return;
+        };
+        if hw.arch == "aarch64" || hw.arch == "i686" {
+            cx.notify();
+            return;
+        }
         if let Some(hw) = self.hw.as_mut() {
             hw.machine = if hw.machine.contains("q35") {
                 "pc".into()
             } else {
                 "q35".into()
             };
+            cx.notify();
+        }
+    }
+
+    fn hw_set_arch(&mut self, arch: &'static str, cx: &mut Context<Self>) {
+        let Some(vm) = self.selected_vm() else {
+            return;
+        };
+        if self.hw.as_ref().map(|hw| hw.arch.as_str()) == Some(arch) {
+            return;
+        }
+        if vm.running() || vm.paused() {
+            self.set_status(self.t("hw.stop_for_arch").to_string(), StatusKind::Error);
+            cx.notify();
+            return;
+        }
+        if !backend::arch_available(arch) {
+            let msg = self.tf("hw.arch_unavailable", &[("arch", arch.to_string())]);
+            self.set_status(msg, StatusKind::Error);
+            cx.notify();
+            return;
+        }
+        let kvm_ok = self.kvm_ok;
+        if let Some(hw) = self.hw.as_mut() {
+            hw.arch = arch.into();
+            match arch {
+                "aarch64" => {
+                    hw.machine = "virt".into();
+                    hw.uefi = true;
+                    hw.tpm = false;
+                    hw.kvm = false;
+                    hw.video = "virtio".into();
+                }
+                "i686" => {
+                    hw.machine = "pc".into();
+                    hw.uefi = false;
+                    hw.tpm = false;
+                    hw.kvm = kvm_ok;
+                }
+                _ => {
+                    hw.machine = "q35".into();
+                    hw.kvm = kvm_ok;
+                }
+            }
             cx.notify();
         }
     }
@@ -2027,6 +2137,13 @@ impl VmmApp {
                     .child(self.info_row(self.t("ov.vcpu"), vcpu_value))
                     .child(self.info_row(self.t("ov.memory"), ram_value))
                     .child(self.info_row(self.t("ov.disk"), fmt_disk(vm.disk_gb)))
+                    .child(
+                        self.info_row(
+                            self.t("ov.arch"),
+                            hw.map(|value| value.arch.clone())
+                                .unwrap_or_else(|| "x86_64".into()),
+                        ),
+                    )
                     .child(self.info_row(self.t("ov.machine"), machine))
                     .child(self.info_row(self.t("ov.firmware"), uefi))
                     .child(self.info_row(self.t("ov.tpm"), tpm))
@@ -2835,6 +2952,51 @@ impl VmmApp {
                 .text_color(col(MUTED))
                 .child(self.t("hw.unavailable"));
         };
+        let mut arch_buttons: Vec<Stateful<Div>> = Vec::new();
+        for arch in backend::ARCHES {
+            if !backend::arch_available(arch) && hw.arch != arch {
+                continue;
+            }
+            let id = match arch {
+                "i686" => "hw_arch_i686",
+                "aarch64" => "hw_arch_aarch64",
+                _ => "hw_arch_x86_64",
+            };
+            let label = match arch {
+                "i686" => "i686",
+                "aarch64" => "ARM64",
+                _ => "x86_64",
+            };
+            let selected = hw.arch == arch;
+            arch_buttons.push(
+                button(
+                    id,
+                    label,
+                    if selected {
+                        BtnKind::Accent
+                    } else {
+                        BtnKind::Normal
+                    },
+                )
+                .h(px(26.))
+                .on_click(
+                    cx.listener(move |this, _: &ClickEvent, _, cx| this.hw_set_arch(arch, cx)),
+                ),
+            );
+        }
+        let arch_native = backend::arch_native(&hw.arch);
+        let machine_value = if hw.arch == "aarch64" {
+            "virt".to_string()
+        } else if hw.arch == "i686" || !hw.machine.contains("q35") {
+            "pc / i440fx".to_string()
+        } else {
+            "q35".to_string()
+        };
+        let video_value = if hw.arch == "aarch64" {
+            "virtio".to_string()
+        } else {
+            hw.video.clone()
+        };
         div()
             .flex()
             .flex_col()
@@ -2886,6 +3048,40 @@ impl VmmApp {
                     ))
                     .child(
                         div()
+                            .py(px(12.))
+                            .border_b_1()
+                            .border_color(col(BORDER))
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child(self.t("hw.arch")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .text_color(col(MUTED))
+                                            .child(self.t("hw.arch_hint")),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.))
+                                    .children(arch_buttons),
+                            ),
+                    )
+                    .child(
+                        div()
                             .flex()
                             .items_center()
                             .justify_between()
@@ -2915,28 +3111,34 @@ impl VmmApp {
                                     .flex()
                                     .items_center()
                                     .gap(px(8.))
-                                    .child(div().text_size(px(11.)).text_color(col(ACCENT)).child(
-                                        if hw.machine.contains("q35") {
-                                            "q35"
-                                        } else {
-                                            "pc / i440fx"
-                                        },
-                                    ))
                                     .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .text_color(col(ACCENT))
+                                            .child(machine_value),
+                                    )
+                                    .child(if hw.arch == "x86_64" {
                                         button("hw_machine", self.t("hw.change"), BtnKind::Normal)
                                             .h(px(28.))
-                                            .on_click(cx.listener(
-                                                |this, _: &ClickEvent, _, cx| {
-                                                    this.hw_cycle_machine(cx)
-                                                },
-                                            )),
-                                    ),
+                                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                                this.hw_cycle_machine(cx)
+                                            }))
+                                            .into_any_element()
+                                    } else {
+                                        div()
+                                            .text_size(px(9.))
+                                            .text_color(col(MUTED))
+                                            .child(self.t("hw.fixed"))
+                                            .into_any_element()
+                                    }),
                             ),
                     )
                     .child(
                         toggle_row(
                             self.t("hw.kvm"),
-                            if self.kvm_ok {
+                            if !arch_native {
+                                self.t("hw.kvm_foreign")
+                            } else if self.kvm_ok {
                                 self.t("hw.kvm_hint")
                             } else {
                                 self.t("hw.kvm_missing")
@@ -2949,18 +3151,36 @@ impl VmmApp {
                         ),
                     )
                     .child(
-                        toggle_row(self.t("hw.uefi"), self.t("hw.uefi_hint"), hw.uefi)
-                            .id("hw_uefi")
-                            .on_click(
-                                cx.listener(|this, _: &ClickEvent, _, cx| this.hw_toggle_uefi(cx)),
-                            ),
+                        toggle_row(
+                            self.t("hw.uefi"),
+                            if hw.arch == "aarch64" {
+                                self.t("hw.uefi_arm")
+                            } else if hw.arch == "i686" {
+                                self.t("hw.uefi_i686")
+                            } else {
+                                self.t("hw.uefi_hint")
+                            },
+                            hw.uefi,
+                        )
+                        .id("hw_uefi")
+                        .on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.hw_toggle_uefi(cx)),
+                        ),
                     )
                     .child(
-                        toggle_row(self.t("hw.tpm"), self.t("hw.tpm_hint"), hw.tpm)
-                            .id("hw_tpm")
-                            .on_click(
-                                cx.listener(|this, _: &ClickEvent, _, cx| this.hw_toggle_tpm(cx)),
-                            ),
+                        toggle_row(
+                            self.t("hw.tpm"),
+                            if hw.arch == "x86_64" {
+                                self.t("hw.tpm_hint")
+                            } else {
+                                self.t("hw.tpm_arch")
+                            },
+                            hw.tpm,
+                        )
+                        .id("hw_tpm")
+                        .on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| this.hw_toggle_tpm(cx)),
+                        ),
                     )
                     .child(
                         toggle_row(
@@ -2990,12 +3210,13 @@ impl VmmApp {
                                             .font_weight(FontWeight::MEDIUM)
                                             .child(self.t("hw.video")),
                                     )
-                                    .child(
-                                        div()
-                                            .text_size(px(10.))
-                                            .text_color(col(MUTED))
-                                            .child(self.t("hw.video_hint")),
-                                    ),
+                                    .child(div().text_size(px(10.)).text_color(col(MUTED)).child(
+                                        if hw.arch == "aarch64" {
+                                            self.t("hw.video_arm")
+                                        } else {
+                                            self.t("hw.video_hint")
+                                        },
+                                    )),
                             )
                             .child(
                                 div()
@@ -3006,7 +3227,7 @@ impl VmmApp {
                                         div()
                                             .text_size(px(11.))
                                             .text_color(col(ACCENT))
-                                            .child(hw.video.clone()),
+                                            .child(video_value),
                                     )
                                     .child(
                                         step_button("hw_video", self.t("hw.change"))
@@ -3132,6 +3353,39 @@ impl VmmApp {
                     cx,
                 ));
             }
+        }
+
+        let mut arch_chips: Vec<Stateful<Div>> = Vec::new();
+        for arch in backend::ARCHES {
+            if !backend::arch_available(arch) && self.form.arch != arch {
+                continue;
+            }
+            let id = match arch {
+                "i686" => "form_arch_i686",
+                "aarch64" => "form_arch_aarch64",
+                _ => "form_arch_x86_64",
+            };
+            let label = match arch {
+                "i686" => "i686 (32-bit)",
+                "aarch64" => "ARM64 (aarch64)",
+                _ => "x86_64",
+            };
+            let selected = self.form.arch == arch;
+            arch_chips.push(
+                button(
+                    id,
+                    label,
+                    if selected {
+                        BtnKind::Accent
+                    } else {
+                        BtnKind::Normal
+                    },
+                )
+                .h(px(28.))
+                .on_click(
+                    cx.listener(move |this, _: &ClickEvent, _, cx| this.form_select_arch(arch, cx)),
+                ),
+            );
         }
 
         let mut grid_rows: Vec<Div> = Vec::new();
@@ -3282,6 +3536,14 @@ impl VmmApp {
                             .text_size(px(10.))
                             .text_color(col(MUTED))
                             .child(self.t("cr.iso_hint")),
+                    )
+                    .child(section_label(self.t("cr.arch")))
+                    .child(div().flex().items_center().gap(px(8.)).children(arch_chips))
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(col(MUTED))
+                            .child(self.t("cr.arch_hint")),
                     )
                     .child(section_label(self.t("cr.os")))
                     .child(div().flex().flex_col().gap(px(8.)).children(grid_rows))
@@ -3469,7 +3731,9 @@ impl VmmApp {
                     .child(
                         toggle_row(
                             self.t("cr.kvm"),
-                            if self.kvm_ok {
+                            if !backend::arch_native(&self.form.arch) {
+                                self.t("hw.kvm_foreign")
+                            } else if self.kvm_ok {
                                 self.t("cr.kvm_hint")
                             } else {
                                 self.t("hw.kvm_missing")
@@ -3479,7 +3743,9 @@ impl VmmApp {
                         .id("form_kvm")
                         .on_click(cx.listener(
                             |this, _: &ClickEvent, _, cx| {
-                                this.form.kvm = !this.form.kvm && this.kvm_ok;
+                                this.form.kvm = !this.form.kvm
+                                    && this.kvm_ok
+                                    && backend::arch_native(&this.form.arch);
                                 cx.notify();
                             },
                         )),

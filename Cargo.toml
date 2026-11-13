@@ -1,6 +1,6 @@
 [package]
 name = "vmm-kvm-rs"
-version = "0.1.0"
+version = "0.1.0-alpha"
 edition = "2024"
 description = "Native Linux QEMU/KVM manager with a gpui interface and libvirt backend"
 repository = "https://github.com/frankrukatlx102-wq/vmm-kvm-rs"

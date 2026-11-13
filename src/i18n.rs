@@ -435,6 +435,14 @@ const STRINGS: &[Entry] = &[
     ),
     s!("ov.disk", "Disk", "Диск", "磁盘", "Disco", "Disco"),
     s!(
+        "ov.arch",
+        "Architecture",
+        "Архитектура",
+        "架构",
+        "Arquitetura",
+        "Arquitectura"
+    ),
+    s!(
         "ov.machine",
         "Machine",
         "Машина",
@@ -578,6 +586,79 @@ const STRINGS: &[Entry] = &[
         "256 MiB – {max}（主机）",
         "256 MiB – {max} (host)",
         "256 MiB – {max} (host)"
+    ),
+    s!("hw.fixed", "fixed", "фиксировано", "固定", "fixo", "fijo"),
+    s!(
+        "hw.arch",
+        "Architecture",
+        "Архитектура",
+        "架构",
+        "Arquitetura",
+        "Arquitectura"
+    ),
+    s!(
+        "hw.arch_hint",
+        "Requires a matching guest OS; stop the VM before changing.",
+        "Нужна подходящая гостевая ОС; остановите ВМ перед сменой.",
+        "需要匹配的客户机系统；更改前请停止虚拟机。",
+        "Requer um sistema convidado compatível; pare a VM antes de alterar.",
+        "Requiere un sistema invitado compatible; detén la VM antes de cambiar."
+    ),
+    s!(
+        "hw.stop_for_arch",
+        "Stop the VM before changing architecture",
+        "Остановите ВМ перед сменой архитектуры",
+        "更改架构前请停止虚拟机",
+        "Pare a VM antes de alterar a arquitetura",
+        "Detén la VM antes de cambiar la arquitectura"
+    ),
+    s!(
+        "hw.arch_unavailable",
+        "QEMU for {arch} is not installed",
+        "QEMU для {arch} не установлен",
+        "未安装 {arch} 的 QEMU",
+        "O QEMU para {arch} não está instalado",
+        "QEMU para {arch} no está instalado"
+    ),
+    s!(
+        "hw.kvm_foreign",
+        "TCG emulation (KVM is unavailable for this architecture)",
+        "Эмуляция TCG (KVM недоступен для этой архитектуры)",
+        "TCG 模拟（此架构不支持 KVM）",
+        "Emulação TCG (KVM indisponível para esta arquitetura)",
+        "Emulación TCG (KVM no disponible para esta arquitectura)"
+    ),
+    s!(
+        "hw.uefi_arm",
+        "ARM64 requires UEFI firmware",
+        "Для ARM64 требуется прошивка UEFI",
+        "ARM64 需要 UEFI 固件",
+        "ARM64 requer firmware UEFI",
+        "ARM64 requiere firmware UEFI"
+    ),
+    s!(
+        "hw.uefi_i686",
+        "UEFI is not available for 32-bit x86 in this build",
+        "UEFI недоступен для 32-битного x86 в этой сборке",
+        "此版本不为 32 位 x86 提供 UEFI",
+        "UEFI não está disponível para x86 de 32 bits nesta compilação",
+        "UEFI no está disponible para x86 de 32 bits en esta compilación"
+    ),
+    s!(
+        "hw.tpm_arch",
+        "TPM 2.0 is available for x86_64 only",
+        "TPM 2.0 доступен только для x86_64",
+        "TPM 2.0 仅适用于 x86_64",
+        "TPM 2.0 está disponível apenas para x86_64",
+        "TPM 2.0 solo está disponible para x86_64"
+    ),
+    s!(
+        "hw.video_arm",
+        "ARM64 uses virtio video",
+        "ARM64 использует virtio-видео",
+        "ARM64 使用 virtio 显卡",
+        "ARM64 usa vídeo virtio",
+        "ARM64 usa vídeo virtio"
     ),
     s!(
         "hw.machine",
@@ -1322,6 +1403,22 @@ const STRINGS: &[Entry] = &[
         "只能使用字母、数字、点、短横线和下划线。",
         "São permitidos letras, números, pontos, hífens e sublinhados.",
         "Se permiten letras, números, puntos, guiones y guiones bajos."
+    ),
+    s!(
+        "cr.arch",
+        "ARCHITECTURE",
+        "АРХИТЕКТУРА",
+        "架构",
+        "ARQUITETURA",
+        "ARQUITECTURA"
+    ),
+    s!(
+        "cr.arch_hint",
+        "The guest OS must match the architecture. ARM64 runs under TCG on x86 hosts.",
+        "Гостевая ОС должна соответствовать архитектуре. ARM64 на x86-хосте работает через TCG.",
+        "客户机操作系统必须与架构匹配。在 x86 主机上 ARM64 使用 TCG 模拟。",
+        "O sistema convidado deve corresponder à arquitetura. ARM64 roda via TCG em hosts x86.",
+        "El sistema invitado debe coincidir con la arquitectura. ARM64 se ejecuta mediante TCG en hosts x86."
     ),
     s!(
         "cr.hardware",

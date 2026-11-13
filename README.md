@@ -2,11 +2,14 @@
 
 **A native QEMU/KVM manager for Linux.** Rust, [gpui](https://github.com/zed-industries/zed/tree/main/crates/gpui) and libvirt — no Qt, no GTK, no browser runtime.
 
+**v0.1 alpha — first public release.** x86_64, 32-bit i686 and ARM64 guests, hardware editing, disks, networking, snapshots and five live languages.
+
 [![Rust](https://img.shields.io/badge/Rust-2024-orange?logo=rust)](https://www.rust-lang.org/)
 [![gpui](https://img.shields.io/badge/UI-gpui-2dd4bf)](https://github.com/zed-industries/zed/tree/main/crates/gpui)
 [![libvirt](https://img.shields.io/badge/backend-libvirt-blue)](https://libvirt.org/)
 [![Linux](https://img.shields.io/badge/platform-Linux-lightgrey?logo=linux)](https://kernel.org/)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
+[![Release](https://img.shields.io/badge/release-v0.1%20alpha-2dd4bf)](https://github.com/frankrukatlx102-wq/vmm-kvm-rs/releases)
 
 ![VMM-KVM main window](docs/screenshots/01-main.png)
 
@@ -41,6 +44,15 @@ Most Linux VM managers are either tied to a heavy desktop stack, built around a 
 This repository is the Rust port of the [PySide6 VMM-KVM](https://github.com/frankrukatlx102-wq/vmm-kvm). The Python application remains the feature-complete reference; this port focuses on the core workflow and a clean native foundation.
 
 ## Features
+
+### Processor architectures
+
+- **x86_64** — the default; q35 or i440fx machine types
+- **i686 / 32-bit x86** — legacy guest support on the i440fx machine
+- **ARM64 / aarch64** — the QEMU `virt` machine with automatic UEFI firmware
+- native KVM acceleration when the guest architecture matches the host; TCG emulation for foreign architectures
+- architecture selection during creation and for stopped VMs in the Hardware tab
+- automatic conversion of disks, controllers and video devices when changing architecture
 
 ### Virtual machines
 
@@ -151,6 +163,8 @@ VM images created by the application live under `~/VirtualMachines/vms/<name>/`,
 ## Requirements
 
 - Linux with libvirt and QEMU/KVM
+- QEMU emulators: `qemu-system-x86_64`, `qemu-system-i386` and `qemu-system-aarch64` for the corresponding guest architectures
+- ARM64 guests additionally need AArch64 UEFI firmware (`edk2-aarch64` / `qemu-efi-aarch64`)
 - `qemu-img` for disk creation
 - `virt-viewer` or `remote-viewer` for the graphical console
 - `xdg-desktop-portal` for the local ISO picker; `zenity` is used as a fallback
@@ -319,6 +333,8 @@ Graceful shutdown requires a working ACPI daemon inside the guest. If the guest 
 
 **Installation media** lists every ISO in `~/VirtualMachines/iso`. **Choose ISO…** opens the system file picker and lets you use an ISO outside that folder. **No installation media** creates an empty VM that can boot from a disk or a later-attached ISO.
 
+The **Architecture** section selects the guest CPU architecture: `x86_64`, `i686 (32-bit)` or `ARM64 (aarch64)`. The ISO and the guest OS must match; ARM64 on an x86 host runs under TCG emulation and is slower than native KVM. ARM64 automatically enables UEFI, and 32-bit i686 uses the i440fx machine without UEFI.
+
 The **Operating system** grid lets you override the automatic detection. Each profile carries its own defaults:
 
 - chipset (`q35` or `i440fx`);
@@ -336,7 +352,8 @@ vCPU and RAM steppers are clamped to the real host limits. KVM acceleration is e
 
 The Hardware tab edits the persistent configuration:
 
-- **Machine type** — q35 (modern) or pc / i440fx (legacy). Switching converts IDE disks to SATA and removes incompatible USB, IDE, PCI and q35-only watchdog devices automatically;
+- **Architecture** — x86_64, i686 or ARM64. Changing it requires a stopped VM and a matching guest OS; disks, controllers, console and video devices are converted automatically;
+- **Machine type** — q35 (modern) or pc / i440fx (legacy) for x86. Switching converts IDE disks to SATA and removes incompatible USB, IDE, PCI and q35-only watchdog devices automatically;
 - **vCPU** and **Memory** — stored in the inactive XML; a running VM may keep its current values until restart;
 - **KVM acceleration** — switches the domain type between `kvm` and `qemu`;
 - **UEFI firmware** — enables OVMF; q35 is selected automatically;
@@ -552,6 +569,9 @@ The Python/PySide6 application remains the reference for features that are still
 | **Cannot connect to libvirt** | Install libvirt and start the session daemon; check `virsh -c qemu:///session list --all`. For system VMs start `libvirtd` and join the `libvirt` group. |
 | **KVM unavailable** | Check `/dev/kvm`; enable AMD-V/Intel VT-x in firmware; load `kvm_amd` or `kvm_intel`. The app still runs with software emulation. |
 | **UEFI VM fails to define** | Install OVMF/edk2-ovmf. The app falls back to an explicit loader if firmware auto-selection fails. |
+| **ARM64 VM fails to start** | Install AArch64 UEFI firmware (`edk2-aarch64` / `qemu-efi-aarch64`) and `qemu-system-aarch64`. |
+| **ARM64 is slow** | Foreign architectures run under TCG. Install a native aarch64 host or use x86_64 for KVM. |
+| **i686 has no UEFI option** | 32-bit x86 is intentionally limited to the legacy i440fx/BIOS path in this release. |
 | **No console window** | Install `virt-viewer` or `remote-viewer`; make sure the VM is running and has SPICE/VNC graphics. |
 | **ISO picker does not open** | Install `xdg-desktop-portal` for your desktop and `zenity` as a fallback. |
 | **Chinese text shows boxes** | Install Noto Sans CJK or another CJK font and restart the app. |
@@ -566,11 +586,29 @@ The Python/PySide6 application remains the reference for features that are still
 - [x] Hardware, disks, network interfaces and snapshots
 - [x] Manual VM names and local ISO picker
 - [x] Five-language live localization
+- [x] x86_64, i686 and ARM64 architecture selection
 - [ ] Storage pool browser
 - [ ] SSH hosts and remote libvirt connections
 - [ ] VM clone and import
 - [ ] Secure Boot and TPM provisioning controls
 - [ ] More detailed guest-agent integration
+
+## Release history
+
+### v0.1 alpha — 2026-11-13
+
+The first public release.
+
+- x86_64, i686 and ARM64 guest architectures
+- architecture and machine-type conversion for stopped VMs
+- q35 / i440fx chipsets with safe disk and controller conversion
+- ARM64 UEFI firmware auto-selection
+- VM creation, hardware, disks, networking and snapshots
+- safe deletion with a modal guard and `domain.xml.bak`
+- five-language interface with live switching
+- reproducible Python vs Rust benchmarks
+
+Known limitations: ARM64 runs under TCG on x86 hosts, 32-bit UEFI is not enabled, and changing architecture requires reinstalling the guest OS. Storage pools, SSH hosts and VM import are planned for later releases.
 
 ## Contributing
 
