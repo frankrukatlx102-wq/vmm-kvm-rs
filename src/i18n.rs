@@ -580,6 +580,22 @@ const STRINGS: &[Entry] = &[
         "256 MiB – {max} (host)"
     ),
     s!(
+        "hw.machine",
+        "Machine type",
+        "Тип машины",
+        "机型",
+        "Tipo de máquina",
+        "Tipo de máquina"
+    ),
+    s!(
+        "hw.machine_hint",
+        "q35 (modern) · pc / i440fx (legacy), IDE ↔ SATA converted automatically",
+        "q35 (современный) · pc / i440fx (старый), IDE ↔ SATA конвертируется автоматически",
+        "q35（现代）· pc / i440fx（旧式），自动转换 IDE ↔ SATA",
+        "q35 (moderno) · pc / i440fx (legado), IDE ↔ SATA convertido automaticamente",
+        "q35 (moderno) · pc / i440fx (heredado), IDE ↔ SATA convertido automáticamente"
+    ),
+    s!(
         "hw.kvm",
         "KVM acceleration",
         "KVM-ускорение",
@@ -613,11 +629,11 @@ const STRINGS: &[Entry] = &[
     ),
     s!(
         "hw.uefi_hint",
-        "q35 machine is selected automatically",
-        "Машина q35 выбирается автоматически",
-        "自动选择 q35 机型",
-        "A máquina q35 é selecionada automaticamente",
-        "La máquina q35 se selecciona automáticamente"
+        "UEFI works on q35 and i440fx machines",
+        "UEFI работает на q35 и i440fx",
+        "UEFI 可用于 q35 和 i440fx 机型",
+        "UEFI funciona nas máquinas q35 e i440fx",
+        "UEFI funciona en máquinas q35 e i440fx"
     ),
     s!(
         "hw.tpm", "TPM 2.0", "TPM 2.0", "TPM 2.0", "TPM 2.0", "TPM 2.0"

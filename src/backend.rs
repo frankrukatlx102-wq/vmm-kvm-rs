@@ -425,6 +425,68 @@ fn interface_element(
     iface
 }
 
+fn convert_machine_devices(root: &mut Element, old_machine: &str, new_machine: &str) {
+    let to_q35 = new_machine.contains("q35") && !old_machine.contains("q35");
+    let Some(devices) = child_mut(root, "devices") else {
+        return;
+    };
+    devices.children.retain(|node| {
+        let XMLNode::Element(element) = node else {
+            return true;
+        };
+        if element.name != "controller" {
+            return true;
+        }
+        let kind = element
+            .attributes
+            .get("type")
+            .map(String::as_str)
+            .unwrap_or("");
+        !matches!(kind, "usb" | "ide" | "pci")
+    });
+    if !new_machine.contains("q35") {
+        devices.children.retain(|node| {
+            !matches!(node, XMLNode::Element(element)
+                if element.name == "watchdog"
+                    && element.attributes.get("model").map(|model| model == "itco").unwrap_or(false))
+        });
+    }
+    for node in &mut devices.children {
+        let XMLNode::Element(element) = node else {
+            continue;
+        };
+        element.children.retain(
+            |child| !matches!(child, XMLNode::Element(address) if address.name == "address"),
+        );
+    }
+    if !to_q35 {
+        return;
+    }
+    let mut index = 0u8;
+    for node in &mut devices.children {
+        let XMLNode::Element(disk) = node else {
+            continue;
+        };
+        if disk.name != "disk" {
+            continue;
+        }
+        let Some(target) = child_mut(disk, "target") else {
+            continue;
+        };
+        if target
+            .attributes
+            .get("bus")
+            .map(|bus| bus == "ide")
+            .unwrap_or(false)
+        {
+            target.attributes.insert("bus".into(), "sata".into());
+            let dev = format!("sd{}", (b'a' + index) as char);
+            target.attributes.insert("dev".into(), dev);
+            index = index.saturating_add(1);
+        }
+    }
+}
+
 impl Backend {
     pub fn connect(uri: &str) -> Result<Self> {
         let conn = Connect::open(Some(uri))?;
@@ -693,11 +755,7 @@ impl Backend {
             }
         }
         if old_machine != hw.machine {
-            if let Some(devs) = child_mut(&mut root, "devices") {
-                devs.children.retain(|n| {
-                    !matches!(n, XMLNode::Element(e) if e.name == "controller" && e.attributes.get("type").map(|t| t == "pci").unwrap_or(false))
-                });
-            }
+            convert_machine_devices(&mut root, &old_machine, &hw.machine);
         }
 
         if let Some(feats) = child_mut(&mut root, "features") {

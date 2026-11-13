@@ -266,12 +266,50 @@ fn run_selftest() -> i32 {
     cleanup_selftest(&b, &iso_name);
     let _ = std::fs::remove_file(&iso_file);
 
-    match (ok, uefi_ok, iso_ok) {
-        (Ok(()), Ok(()), Ok(())) => {
+    let legacy_name = format!("vmmself-rs-legacy-{}", std::process::id());
+    cleanup_selftest(&b, &legacy_name);
+    let legacy_ok = (|| -> Result<(), String> {
+        b.create_vm(
+            &legacy_name,
+            osdata::find("windows-7"),
+            2,
+            2048,
+            10,
+            "",
+            true,
+        )
+        .map_err(|e| e.to_string())?;
+        let mut hw = b.hw_read(&legacy_name).map_err(|e| e.to_string())?;
+        hw.uefi = true;
+        b.hw_apply(&legacy_name, &hw)
+            .map_err(|e| format!("UEFI on i440fx failed: {e}"))?;
+        hw.machine = "q35".into();
+        b.hw_apply(&legacy_name, &hw)
+            .map_err(|e| format!("pc -> q35 failed: {e}"))?;
+        let hw2 = b.hw_read(&legacy_name).map_err(|e| e.to_string())?;
+        if !hw2.machine.contains("q35") {
+            return Err(format!("machine was not changed: {}", hw2.machine));
+        }
+        let disks = b.disks(&legacy_name).map_err(|e| e.to_string())?;
+        if disks.iter().any(|disk| disk.bus == "ide") {
+            return Err("IDE disk remained after q35 switch".to_string());
+        }
+        let mut hw3 = hw2;
+        hw3.machine = "pc".into();
+        hw3.uefi = false;
+        b.hw_apply(&legacy_name, &hw3)
+            .map_err(|e| format!("q35 -> pc failed: {e}"))?;
+        println!("ok: pc/q35 machine conversion");
+        Ok(())
+    })();
+    cleanup_selftest(&b, &legacy_name);
+
+    match (ok, uefi_ok, iso_ok, legacy_ok) {
+        (Ok(()), Ok(()), Ok(()), Ok(())) => {
             println!("SELFTEST PASS");
             0
         }
-        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+        (Err(e), _, _, _) | (_, Err(e), _, _) | (_, _, Err(e), _) | (_, _, _, Err(e)) => {
             println!("FAIL: {e}");
             println!("SELFTEST FAIL");
             1

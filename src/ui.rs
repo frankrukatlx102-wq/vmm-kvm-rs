@@ -832,9 +832,6 @@ impl VmmApp {
     fn hw_toggle_uefi(&mut self, cx: &mut Context<Self>) {
         if let Some(hw) = self.hw.as_mut() {
             hw.uefi = !hw.uefi;
-            if hw.uefi {
-                hw.machine = "q35".into();
-            }
             cx.notify();
         }
     }
@@ -859,6 +856,17 @@ impl VmmApp {
                 "qxl" => "virtio".into(),
                 "virtio" => "vga".into(),
                 _ => "qxl".into(),
+            };
+            cx.notify();
+        }
+    }
+
+    fn hw_cycle_machine(&mut self, cx: &mut Context<Self>) {
+        if let Some(hw) = self.hw.as_mut() {
+            hw.machine = if hw.machine.contains("q35") {
+                "pc".into()
+            } else {
+                "q35".into()
             };
             cx.notify();
         }
@@ -2876,6 +2884,55 @@ impl VmmApp {
                         HwField::Ram,
                         cx,
                     ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .py(px(12.))
+                            .border_b_1()
+                            .border_color(col(BORDER))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.))
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .child(self.t("hw.machine")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.))
+                                            .text_color(col(MUTED))
+                                            .child(self.t("hw.machine_hint")),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(8.))
+                                    .child(div().text_size(px(11.)).text_color(col(ACCENT)).child(
+                                        if hw.machine.contains("q35") {
+                                            "q35"
+                                        } else {
+                                            "pc / i440fx"
+                                        },
+                                    ))
+                                    .child(
+                                        button("hw_machine", self.t("hw.change"), BtnKind::Normal)
+                                            .h(px(28.))
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, _, cx| {
+                                                    this.hw_cycle_machine(cx)
+                                                },
+                                            )),
+                                    ),
+                            ),
+                    )
                     .child(
                         toggle_row(
                             self.t("hw.kvm"),

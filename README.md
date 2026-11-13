@@ -336,6 +336,7 @@ vCPU and RAM steppers are clamped to the real host limits. KVM acceleration is e
 
 The Hardware tab edits the persistent configuration:
 
+- **Machine type** — q35 (modern) or pc / i440fx (legacy). Switching converts IDE disks to SATA and removes incompatible USB, IDE, PCI and q35-only watchdog devices automatically;
 - **vCPU** and **Memory** — stored in the inactive XML; a running VM may keep its current values until restart;
 - **KVM acceleration** — switches the domain type between `kvm` and `qemu`;
 - **UEFI firmware** — enables OVMF; q35 is selected automatically;
